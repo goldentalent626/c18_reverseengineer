@@ -1,4 +1,4 @@
-// c18ctl.c - SOAI C18 (12c9:2003) LED control via libusb
+// c18ctl.c - SOAI C18 (12c9:2003) control via libusb (LED, polling rate, DPI stage, profile)
 // Build:
 //   gcc c18ctl.c -o c18ctl $(pkg-config --cflags --libs libusb-1.0)
 // Usage:
@@ -8,6 +8,11 @@
 //   sudo ./c18ctl flowing fast|mid|slow
 //   sudo ./c18ctl breathing fast|mid|slow
 //   sudo ./c18ctl wave fast|mid|slow
+//   sudo ./c18ctl profile <1|2>
+//   sudo ./c18ctl polling <125|250|500|1000> [profile]
+//   sudo ./c18ctl dpi-stage <1-5> [profile]
+//
+// See PROTOCOL.md for the full reverse-engineered protocol this is built from.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,10 +53,30 @@ static const unsigned char EFFECT_TAIL_DEFAULT[24] = {
   0x31,0x00,0x31, 0x00,0x31,0x31, 0x31,0x31,0x31, 0x31,0x31,0x31
 };
 
-// Feature reports observed in your Windows captures
-static const unsigned char FEAT_UNLOCK[8] = {0x01,0x88,0x00,0x00,0x00,0x00,0x00,0x76};
-static const unsigned char FEAT_ARM[8]    = {0x0c,0x01,0x80,0x00,0x00,0x00,0x00,0x72};
-static const unsigned char FEAT_FINAL[8]  = {0x02,0x01,0x00,0x00,0x00,0x00,0x00,0xfc};
+// All 8-byte control commands share one wrapper: SET_REPORT(Feature), and every
+// command's 8 bytes sum to exactly 0xFF, i.e. checksum = 0xFF - sum(byte[0..6]).
+// Confirmed against every opcode captured, including across both DPI profiles.
+static unsigned char checksum8(const unsigned char b[7]) {
+  unsigned int sum = 0;
+  for (int i = 0; i < 7; i++) sum += b[i];
+  return (unsigned char)(0xFF - (sum & 0xFF));
+}
+
+static void build_cmd(unsigned char out[8], unsigned char opcode, unsigned char b1, unsigned char b2) {
+  out[0] = opcode;
+  out[1] = b1;
+  out[2] = b2;
+  out[3] = out[4] = out[5] = out[6] = 0x00;
+  out[7] = checksum8(out);
+}
+
+// Opcodes (see PROTOCOL.md)
+#define OP_BEGIN                0x01 // begin transaction: build_cmd(_, 0x01, 0x88, 0x00)
+#define OP_SELECT_COMMIT        0x02 // select active profile / commit: build_cmd(_, 0x02, profile, 0x00)
+#define OP_SET_POLLING          0x03 // build_cmd(_, 0x03, profile, interval_ms)
+#define OP_SET_DPI_STAGE        0x04 // build_cmd(_, 0x04, profile, stage)
+#define OP_PREPARE_DPI_TABLE    0x0c // build_cmd(_, 0x0c, profile, 0x80)
+#define OP_PREPARE_BUTTON_TABLE 0x0d // build_cmd(_, 0x0d, profile, 0x80)
 
 static int set_feature(libusb_device_handle *h, int iface, const unsigned char feat[8]) {
   return libusb_control_transfer(
@@ -71,6 +96,39 @@ static int out64(libusb_device_handle *h, unsigned char ep_out, const unsigned c
   int rc = libusb_interrupt_transfer(h, ep_out, (unsigned char*)buf, 64, &transferred, 1000);
   if (xfer) *xfer = transferred;
   return rc;
+}
+
+static const int VENDOR_IFACE = 2;
+
+static void send_cmd(libusb_device_handle *h, unsigned char opcode, unsigned char b1, unsigned char b2, const char *label) {
+  unsigned char cmd[8];
+  build_cmd(cmd, opcode, b1, b2);
+  int rc = set_feature(h, VENDOR_IFACE, cmd);
+  if (rc < 0) fprintf(stderr, "%s failed: %d\n", label, rc);
+  usleep(20000);
+}
+
+static unsigned char parse_profile(const char *s) {
+  if (!s) return 1;
+  if (streq(s, "1")) return 1;
+  if (streq(s, "2")) return 2;
+  die("Profile must be: 1|2");
+  return 0;
+}
+
+static unsigned char parse_polling(const char *s) {
+  if (streq(s, "1000")) return 0x01;
+  if (streq(s, "500"))  return 0x02;
+  if (streq(s, "250"))  return 0x04;
+  if (streq(s, "125"))  return 0x08;
+  die("Polling rate must be: 125|250|500|1000");
+  return 0;
+}
+
+static unsigned char parse_dpi_stage(const char *s) {
+  int v = atoi(s);
+  if (v < 1 || v > 5) die("DPI stage must be 1-5");
+  return (unsigned char)v;
 }
 
 static int find_mode_block(unsigned char payload[64]) {
@@ -200,37 +258,68 @@ static void usage(void) {
     "  sudo ./c18ctl flowing <fast|mid|slow>\n"
     "  sudo ./c18ctl breathing <fast|mid|slow>\n"
     "  sudo ./c18ctl wave <fast|mid|slow>\n"
+    "  sudo ./c18ctl profile <1|2>\n"
+    "  sudo ./c18ctl polling <125|250|500|1000> [profile]\n"
+    "  sudo ./c18ctl dpi-stage <1-5> [profile]\n"
     "\n"
     "Colors: red green blue yellow purple cyan white off\n"
+    "\n"
+    "DPI value table and button remapping are not implemented yet — see\n"
+    "PROTOCOL.md for what's decoded and what's still missing.\n"
   );
 }
+
+enum cmd_kind { KIND_LED, KIND_PROFILE, KIND_POLLING, KIND_DPI_STAGE };
 
 int main(int argc, char **argv) {
   if (argc < 2) { usage(); return 2; }
 
   unsigned char payload[64];
+  enum cmd_kind kind;
+  unsigned char profile = 1;
+  unsigned char arg_byte = 0; // polling interval or dpi stage, depending on kind
 
   const char *cmd = argv[1];
 
   if (streq(cmd, "off")) {
+    kind = KIND_LED;
     build_payload_off(payload);
   } else if (streq(cmd, "static")) {
     if (argc < 3) { usage(); return 2; }
+    kind = KIND_LED;
     const char *color = argv[2];
     const char *lvl = (argc >= 4) ? argv[3] : "high";
     build_payload_static(payload, color, lvl);
   } else if (streq(cmd, "neon")) {
     if (argc < 3) { usage(); return 2; }
+    kind = KIND_LED;
     build_payload_mode_speed(payload, 0x03, speed_neon(argv[2]), 0x00);
   } else if (streq(cmd, "flowing")) {
     if (argc < 3) { usage(); return 2; }
+    kind = KIND_LED;
     build_payload_mode_speed(payload, 0x06, speed_flowing(argv[2]), 0x0a);
   } else if (streq(cmd, "breathing")) {
     if (argc < 3) { usage(); return 2; }
+    kind = KIND_LED;
     build_payload_mode_speed(payload, 0x02, speed_breathing(argv[2]), 0x0a);
   } else if (streq(cmd, "wave")) {
     if (argc < 3) { usage(); return 2; }
+    kind = KIND_LED;
     build_payload_mode_speed(payload, 0x04, speed_wave(argv[2]), 0x10);
+  } else if (streq(cmd, "profile")) {
+    if (argc < 3) { usage(); return 2; }
+    kind = KIND_PROFILE;
+    profile = parse_profile(argv[2]);
+  } else if (streq(cmd, "polling")) {
+    if (argc < 3) { usage(); return 2; }
+    kind = KIND_POLLING;
+    arg_byte = parse_polling(argv[2]);
+    profile = parse_profile(argc >= 4 ? argv[3] : NULL);
+  } else if (streq(cmd, "dpi-stage")) {
+    if (argc < 3) { usage(); return 2; }
+    kind = KIND_DPI_STAGE;
+    arg_byte = parse_dpi_stage(argv[2]);
+    profile = parse_profile(argc >= 4 ? argv[3] : NULL);
   } else {
     usage();
     return 2;
@@ -262,36 +351,35 @@ int main(int argc, char **argv) {
     }
   }
 
-  // Primer 64 bytes: ff ff 00... (Windows sends this)
-  unsigned char primer[64] = {0};
-  primer[0] = 0xff;
-  primer[1] = 0xff;
+  send_cmd(h, OP_BEGIN, 0x88, 0x00, "begin");
 
-  const int vendor_iface = 2;
-  const unsigned char ep_out = 0x04;
+  if (kind == KIND_LED) {
+    // Primer 64 bytes: ff ff 00... (Windows sends this)
+    unsigned char primer[64] = {0};
+    primer[0] = 0xff;
+    primer[1] = 0xff;
 
-  // Send in the order proven to work
-  int xfer = 0;
+    const unsigned char ep_out = 0x04;
+    int xfer = 0;
 
-  rc = set_feature(h, vendor_iface, FEAT_UNLOCK);
-  if (rc < 0) fprintf(stderr, "unlock failed: %d\n", rc);
-  usleep(20000);
+    send_cmd(h, OP_PREPARE_DPI_TABLE, profile, 0x80, "prepare table");
 
-  rc = set_feature(h, vendor_iface, FEAT_ARM);
-  if (rc < 0) fprintf(stderr, "arm failed: %d\n", rc);
-  usleep(20000);
+    rc = out64(h, ep_out, primer, &xfer);
+    if (rc || xfer != 64) fprintf(stderr, "primer out failed: rc=%d xfer=%d\n", rc, xfer);
+    usleep(20000);
 
-  rc = out64(h, ep_out, primer, &xfer);
-  if (rc || xfer != 64) fprintf(stderr, "primer out failed: rc=%d xfer=%d\n", rc, xfer);
-  usleep(20000);
+    rc = out64(h, ep_out, payload, &xfer);
+    if (rc || xfer != 64) fprintf(stderr, "payload out failed: rc=%d xfer=%d\n", rc, xfer);
+    usleep(40000);
+  } else if (kind == KIND_POLLING) {
+    send_cmd(h, OP_SET_POLLING, profile, arg_byte, "set polling rate");
+  } else if (kind == KIND_DPI_STAGE) {
+    send_cmd(h, OP_SET_DPI_STAGE, profile, arg_byte, "set dpi stage");
+  }
+  // KIND_PROFILE has no extra command — OP_SELECT_COMMIT below both selects
+  // the profile and commits, per PROTOCOL.md's transaction model.
 
-  rc = out64(h, ep_out, payload, &xfer);
-  if (rc || xfer != 64) fprintf(stderr, "payload out failed: rc=%d xfer=%d\n", rc, xfer);
-  usleep(40000);
-
-  rc = set_feature(h, vendor_iface, FEAT_FINAL);
-  if (rc < 0) fprintf(stderr, "final failed: %d\n", rc);
-  usleep(20000);
+  send_cmd(h, OP_SELECT_COMMIT, profile, 0x00, "commit");
 
   for (int i = 0; i < 3; i++) {
     libusb_release_interface(h, ifaces[i]);
