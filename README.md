@@ -22,11 +22,13 @@ configured on Linux via Piper.
   references. Real limitation: no readback exists, so every call rewrites the
   whole table and resets any other previously-set button back to factory
   default (same limitation applies to `dpi-set`).
-- **Macro upload: not implemented** — referencing an existing macro by ID
-  works, and the ID *allocation pattern* is now understood (sequential,
-  shared pool with Armoury presets, not driver-controllable), but the actual
-  device-side trigger for creating a *new* macro was never captured, so a
-  driver still can't create one.
+- **Macro upload: not implemented, but the hard part is resolved.** Macro
+  creation is confirmed 100% host-side — the device never negotiates or
+  allocates an ID, so a driver is free to pick any unused one itself.
+  What's still missing is a raw capture reconciling the two described
+  upload mechanisms (`0x09` control packets vs. `0x0f`+64-byte table write)
+  into an actual byte-level packet format; referencing an existing macro by
+  ID already works (`c18ctl button <slot> macro`).
 - **Armoury (burst-fire presets): protocol fully decoded, not implemented as
   a CLI command** — the variable-length packet format wasn't worth the added
   surface without a concrete use case; see `PROTOCOL.md`.
@@ -170,12 +172,14 @@ confirmed vs. inferred.
 
 ## Contributing captures
 
-The one functional gap left is macro *upload*. Referencing an existing macro
-works, and the ID allocation pattern is understood, but the device-side
-trigger for creating a brand-new macro was never isolated. What's needed: a
-capture of the exact moment a *new* macro is first created and saved in the
-vendor software, before it's ever assigned to a button — that's the step
-that reveals how (or whether) a specific ID gets returned. See `PROTOCOL.md`
-→ "Open items" for the full list (DPI-table bytes 7-9/40-63 and the
-button-remap trailer are also technically undecoded, but both are confirmed
-fixed/inert, so they don't block anything).
+The one functional gap left is macro *upload*. The ID question is resolved
+(macro creation is entirely host-side; the device never allocates or
+validates an ID, so a driver can pick any unused one). What's still needed
+is a raw capture of an actual macro-content upload: assign a *new* macro
+(2-3 keys is plenty) to a button and export the complete byte sequence from
+the moment "Apply/Save" is clicked, so the `0x09`-vs-`0x0f` upload-mechanism
+question can be resolved with concrete bytes — the same rigor already
+applied to the DPI stages and button table. See `PROTOCOL.md` → "Open
+items" for the full list (DPI-table bytes 7-9/40-63 and the button-remap
+trailer are also technically undecoded, but both are confirmed fixed/inert,
+so they don't block anything).

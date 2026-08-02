@@ -54,7 +54,7 @@ commands (see "LED / RGB" below) — same formula, same transaction wrapper.
 | `0x02` | Select/commit active profile | `02 <profile#> 00 00 00 00 00 <checksum>` | Implemented (`c18ctl profile`, and as the commit step of every command) |
 | `0x03` | Set polling rate | `03 <profile#> <interval_ms> 00 00 00 00 <checksum>` | Implemented (`c18ctl polling`) |
 | `0x04` | Set active DPI stage | `04 <profile#> <stage 1-5> 00 00 00 00 <checksum>` | Implemented (`c18ctl dpi-stage`) |
-| `0x09` | Macro event data | `09 <event> <keycode> ...` (see Macros below) | Not implemented — macro-slot-ID assignment isn't understood (see Open items) |
+| `0x09` | Macro event data | `09 <event> <keycode> ...` (see Macros below) | Not implemented — ID assignment is resolved (a driver can pick any unused ID, no device negotiation needed), but the exact content-upload packet framing has no raw capture example (see Open items) |
 | `0x0c` | Prepare to write DPI table | `0c <profile#> 80 00 00 00 00 <checksum>` — precedes the DPI-table primer+data writes on endpoint `0x04` | Implemented — this is the same "prepare table" step the LED command sequence already used (previously named `FEAT_ARM`). The 64-byte DPI table write itself is implemented for all 5 stages (`c18ctl dpi-set <stage> <dpi>`). |
 | `0x0d` | Prepare to write button table | `0d <profile#> 80 00 00 00 00 <checksum>` — precedes the button-table write on endpoint `0x04` | Implemented (`c18ctl button`) |
 | `0x0f` | Prepare to upload extended per-reference data | `0f <table_type> 80 00 00 00 00 <checksum>` — general-purpose, not tied to one feature. `table_type=0x04` seen preceding both Armoury fire-parameter uploads and macro keyboard-event-data uploads (assigning any macro, even an unchanged existing one, re-triggers this and re-sends the macro's full data) | Not implemented (macro upload / Armoury fire-parameter upload out of scope — see Open items) |
@@ -325,38 +325,47 @@ Windows system-menu mnemonics.
   all, only keyboard keystrokes. This matches libratbag's own macro model (an
   array of `(type, value)` tuples), so this is not a limitation for a
   libratbag driver.
-- Uploaded via opcode `0x09` `SET_REPORT` control transfers (8 bytes each),
-  wrapped in the standard begin/commit transaction. Assigning a macro to a
-  button (even an *existing*, unchanged one) also re-transmits its full
-  keyboard-event data via opcode `0x0f`, `table_type=0x04`.
+- Two different upload mechanisms have been *described* in this document but
+  never reconciled with an actual raw capture of a full macro upload:
+  opcode `0x09` `SET_REPORT` control transfers (8 bytes each), and/or
+  opcode `0x0f` (`table_type=0x04`) followed by a 64-byte write on endpoint
+  `0x04` — assigning a macro to a button (even an *existing*, unchanged one)
+  triggers the latter, resending the macro's full keyboard-event data. Which
+  of these actually carries a *new* macro's content, in what packet framing
+  (event count/length prefix, how many events fit per packet, ordering
+  relative to the button-slot reference write), has no raw byte example
+  anywhere in this document. **This is the one remaining gap** — see Open
+  items.
 - Each keyboard event = 2 bytes: `[event_byte][HID_keycode]`
   - `event_byte` bit 7 (`0x80`): `0`=press, `1`=release
   - `event_byte` bits 0–6: timing/delay value, unit not calibrated (varies with real typing rhythm)
-- The assigning button's slot gets `type = 0x0009 | (repeat_mode<<8), value=<macro ID>` — confirmed via a direct test (existing macro ID `0x0004`) and via 3 isolated repeat-mode tests. **`c18ctl button <slot> macro <id> <mode>` implements the reference side of this** (type/value construction) but **cannot create/upload a macro** — see "Macro ID assignment" below.
+- The assigning button's slot gets `type = 0x0009 | (repeat_mode<<8), value=<macro ID>` — confirmed via a direct test (existing macro ID `0x0004`) and via 3 isolated repeat-mode tests. **`c18ctl button <slot> macro <id> <mode>` implements this reference side** (type/value construction, for an ID you already know) — see "Macro ID assignment" below for why the ID no longer needs to be *discovered*, even though uploading new content still isn't implemented.
 
-### Macro ID assignment
+### Macro ID assignment — resolved: no device-side negotiation exists
 
-**IDs are device/software-managed, sequential, and not predictable or
-user-controlled** — a driver can't choose a macro's ID itself. Confirmed by
-creating two distinct new macros ("anothermacro" then "anothermacro2") and
-assigning each to a different button: they got IDs `0x0004` and `0x0007`
-respectively — not consecutive. The gap (`0x0005`, `0x0006`) is very likely
-Armoury presets created earlier in the same session ("test", "Armoury1",
-"Armoury2"), since Armoury references use the identical
-`base_type | (mode<<8)` pattern (`0x0c` base vs. macro's `0x0009` base) —
-strongly suggesting **macros and Armoury presets share one common,
-sequentially-allocated ID pool**, not two separate counters.
+**Macro creation is entirely host-side software.** Confirmed by isolating
+the exact create → record → stop-recording → save sequence (a genuinely new
+macro, keys "1" and "2") with **zero button assignment** and **zero
+Apply/Save on the main window** — the resulting capture had **no USB traffic
+whatsoever** beyond the generic device-descriptor read at time 0. The device
+does not learn a macro exists, and has no concept of ID allocation, until
+the moment it's assigned to a button (which is exactly when content +
+reference always get uploaded together).
 
-**Still blocks macro upload**: the *allocation pattern* is now understood
-(sequential, shared pool, not driver-controllable), but the actual
-device-side trigger for "create a brand new macro and get back its ID"
-wasn't isolated/captured — the ID just showed up already assigned by the
-time a button-slot reference was captured. `c18ctl button <slot> macro <id>
-<mode>` still only works for an ID you already know from having created the
-macro via the vendor software; a driver wanting to create macros would need
-either a dedicated capture of the creation step itself, or to maintain its
-own counter mirroring the device's allocation order (risky — collides with
-anything created via the vendor software).
+The IDs seen in earlier tests (`0x0004`, `0x0007` for two vendor-software-
+created macros, non-consecutive — the gap matches Armoury presets created in
+the same session, since Armoury references use the identical
+`base_type | (mode<<8)` pattern) reflect the **vendor software's own
+internal counter**, not anything the device tracks or validates.
+
+**This resolves the ID half of the problem**: a driver doesn't need to
+discover or negotiate an ID with the device — it can pick any ID not already
+in use by that profile's buttons/Armoury presets (tracked in the driver's
+own state) and send it directly in the button-slot reference write. **It
+does not resolve the content-upload half** — see the upload-mechanism note
+above and Open items. `c18ctl button <slot> macro` therefore still only
+*references* an ID (useful for an already-known macro from the vendor
+software); it does not create/upload macro content.
 
 ## Armoury (burst-fire macro, "N Key") — protocol fully understood, not implemented in `c18ctl`
 
@@ -517,11 +526,20 @@ shared pool between macros and Armoury presets, not driver-controllable).
 
 Genuinely still open:
 
-- **Macro upload still blocked**: the ID allocation *pattern* is understood
-  (see "Macro ID assignment" above), but the device-side trigger for
-  "create a brand new macro" itself was never isolated/captured — the ID
-  just showed up already assigned. Referencing an already-known ID is
-  implemented (`c18ctl button <slot> macro`); creating one isn't.
+- **Macro upload still blocked, but not on the ID question anymore.**
+  Macro creation is now confirmed 100% host-side (an isolated create/
+  record/save capture with no button assignment produced zero USB traffic)
+  — the device never negotiates an ID, so a driver can pick any unused one
+  itself. What's still missing is a raw capture of an actual macro-content
+  upload: two upload mechanisms are described (`0x09` 8-byte control
+  packets, and/or `0x0f`+64-byte table write) but never reconciled with a
+  concrete byte example, so the packet framing (event count/length prefix,
+  events-per-packet, ordering vs. the button-slot reference write) is
+  unknown. **Need**: capture assigning a *new* macro (2-3 keys is enough) to
+  a button and export the complete raw byte sequence from the moment
+  "Apply/Save" is clicked — the same rigor already applied to DPI stages and
+  buttons. Referencing an already-known ID is implemented (`c18ctl button
+  <slot> macro`); creating/uploading content isn't.
 - Bytes 28–31 and 48–63 of the **button-remap** packet: confirmed
   fixed/identical across both profiles' factory defaults and unchanged
   through the full 11-button sweep, so likely genuinely reserved — but not
