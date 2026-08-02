@@ -2,10 +2,10 @@
 
 Reverse-engineered USB HID protocol for the SOAI C18 gaming mouse (USB VID:PID
 `12c9:2003`), with a working Linux CLI (`c18ctl`) covering RGB lighting, profile
-select, polling rate, DPI active-stage select, DPI stage-2 value, and full
-button remapping (all 11 buttons — keys, media keys, native clicks, DPI/profile
-functions, keyboard-modifier shortcuts, Combo Key, Exact Control, and macro
-references). Long-term goal is a full
+select, polling rate, DPI (both active-stage select and all 5 stages' DPI
+values), and full button remapping (all 11 buttons — keys, media keys, native
+clicks, DPI/profile functions, keyboard-modifier shortcuts, Combo Key, Exact
+Control, and macro references). Long-term goal is a full
 [libratbag](https://github.com/libratbag/libratbag) driver so the mouse can be
 configured on Linux via Piper.
 
@@ -13,23 +13,22 @@ configured on Linux via Piper.
 
 - **LED/lighting: fully decoded and working.** off, static color/brightness,
   neon, breathing, flowing, and wave modes.
-- **Profile select, polling rate, DPI active-stage select: decoded and working**
-  (`c18ctl profile|polling|dpi-stage`).
-- **DPI stage-2 value: decoded and working** (`c18ctl dpi-set 2 <dpi>`). Stages
-  1/3/4/5 have a claimed-but-unverified offset table — see `PROTOCOL.md` →
-  "Open items" for why it's not implemented yet.
+- **Profile select, polling rate, DPI active-stage select, DPI value (all 5
+  stages): fully decoded and working** (`c18ctl profile|polling|dpi-stage|dpi-set`).
 - **Button remapping: fully decoded and working for all 11 buttons**
   (`c18ctl button`) — keyboard keys, media keys, native mouse clicks,
   DPI/profile functions, keyboard-modifier shortcuts (single and two-key),
   Combo Key (Double-click/Three-click/Fire Button), Exact Control, and macro
   references. Real limitation: no readback exists, so every call rewrites the
   whole table and resets any other previously-set button back to factory
-  default.
+  default (same limitation applies to `dpi-set` and other stages/profile
+  metadata bytes it can't decode yet).
 - **Macro upload: not implemented** — referencing an existing macro by ID
   works, but the macro-slot-ID assignment mechanism (how the device picks an
   ID for a *new* macro) isn't understood.
-- **Armoury (burst-fire presets): not implemented** — preset-index semantics
-  unconfirmed.
+- **Armoury (burst-fire presets): protocol fully decoded, not implemented as
+  a CLI command** — the variable-length packet format wasn't worth the added
+  surface without a concrete use case; see `PROTOCOL.md`.
 - **libratbag driver: not started** — blocked on the above.
 
 See [`PROTOCOL.md`](PROTOCOL.md) for the full reverse-engineered wire protocol.
@@ -68,7 +67,7 @@ sudo ./c18ctl wave      <fast|mid|slow>
 sudo ./c18ctl profile    <1|2>
 sudo ./c18ctl polling    <125|250|500|1000> [profile]
 sudo ./c18ctl dpi-stage  <1-5> [profile]
-sudo ./c18ctl dpi-set    <stage=2> <dpi 200-10000> [profile]
+sudo ./c18ctl dpi-set    <stage 1-5> <dpi 200-10000> [profile]
 
 sudo ./c18ctl button <slot 1-11> off [profile]
 sudo ./c18ctl button <slot 1-11> key <a-z0-9|0xHH> [profile]
@@ -99,12 +98,13 @@ button "9"/"10" gap in the numbering as shown on the mouse — see
 `PROTOCOL.md` for the exact byte layout).
 
 All commands default to profile 1 when the optional `[profile]` argument is
-omitted. `dpi-set` only supports stage 2 right now — see `PROTOCOL.md` for an
-open question about whether the other 4 stages' offsets are actually located
-correctly. Every `button` call rewrites the whole 64-byte button table, so it
-resets any other previously-set button on that profile back to factory
-default — there's no way to read the device's current table back to preserve
-it.
+omitted. `dpi-set` writes the whole DPI table, seeded from the target
+profile's factory-default table with only the requested stage's 2 bytes
+patched — bytes elsewhere in that table (still undecoded, see `PROTOCOL.md`)
+are preserved as-is from the default rather than from whatever the device's
+actual current state is (impossible to know without readback). Every
+`button` call similarly rewrites the whole 64-byte button table, resetting
+any other previously-set button on that profile back to factory default.
 
 Example:
 
@@ -169,12 +169,9 @@ confirmed vs. inferred.
 
 ## Contributing captures
 
-DPI stages 1, 3, 4, and 5 are the main gap. A claimed offset table for them
-exists but doesn't match the raw bytes shown anywhere else in `PROTOCOL.md` —
-see "Per-stage offset claim" and "Open items" there for the specifics. What's
-needed: the actual raw before/after packet bytes (not just a claimed offset
-table) from a Wireshark + USBPcap capture (filtered to `usb.idVendor ==
-0x12c9 && usb.idProduct == 0x2003`) of editing one non-stage-2 DPI stage
-through at least two different DPI values, exported as full raw 64-byte
-payloads (not hand-transcribed) — the same rigor the stage-2 template already
-has. Once that lands, `dpi-set` can be extended past stage 2.
+The main remaining gaps are decoding DPI-table bytes 7-9/40-63 (still unknown
+per-profile metadata, doesn't affect current functionality) and macro-upload
+support (needs the slot-ID assignment mechanism figured out — capture the
+exact moment a *new* macro is first created and saved, before it's ever
+referenced by a button, to see how its ID gets picked). See `PROTOCOL.md` →
+"Open items" for the full list.

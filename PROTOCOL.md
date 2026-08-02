@@ -55,7 +55,7 @@ commands (see "LED / RGB" below) — same formula, same transaction wrapper.
 | `0x03` | Set polling rate | `03 <profile#> <interval_ms> 00 00 00 00 <checksum>` | Implemented (`c18ctl polling`) |
 | `0x04` | Set active DPI stage | `04 <profile#> <stage 1-5> 00 00 00 00 <checksum>` | Implemented (`c18ctl dpi-stage`) |
 | `0x09` | Macro event data | `09 <event> <keycode> ...` (see Macros below) | Not implemented — macro-slot-ID assignment isn't understood (see Open items) |
-| `0x0c` | Prepare to write DPI table | `0c <profile#> 80 00 00 00 00 <checksum>` — precedes the DPI-table primer+data writes on endpoint `0x04` | Implemented — this is the same "prepare table" step the LED command sequence already used (previously named `FEAT_ARM`). The 64-byte DPI table write itself is implemented for **stage 2 only** (`c18ctl dpi-set 2 <dpi>`) — see Open items for stages 1/3/4/5. |
+| `0x0c` | Prepare to write DPI table | `0c <profile#> 80 00 00 00 00 <checksum>` — precedes the DPI-table primer+data writes on endpoint `0x04` | Implemented — this is the same "prepare table" step the LED command sequence already used (previously named `FEAT_ARM`). The 64-byte DPI table write itself is implemented for all 5 stages (`c18ctl dpi-set <stage> <dpi>`). |
 | `0x0d` | Prepare to write button table | `0d <profile#> 80 00 00 00 00 <checksum>` — precedes the button-table write on endpoint `0x04` | Implemented (`c18ctl button`) |
 | `0x0f` | Prepare to upload extended per-reference data | `0f <table_type> 80 00 00 00 00 <checksum>` — general-purpose, not tied to one feature. `table_type=0x04` seen preceding both Armoury fire-parameter uploads and macro keyboard-event-data uploads (assigning any macro, even an unchanged existing one, re-triggers this and re-sends the macro's full data) | Not implemented (macro upload / Armoury fire-parameter upload out of scope — see Open items) |
 
@@ -129,43 +129,13 @@ device-specific.
 ### Active stage select
 Opcode `0x04`, byte2 = stage number `1`-`5`. e.g. `04 01 02 00 00 00 00 f8` = select stage 2.
 
-### DPI value table (implemented for stage 2 only — `c18ctl dpi-set 2 <dpi>`)
+### DPI value table (implemented for all 5 stages — `c18ctl dpi-set <stage> <dpi>`)
 Written as a 64-byte packet on interrupt endpoint `0x04`, preceded by a
 64-byte primer packet (`ff ff 00 00 ... 00`) in the same transaction — same
 primer already used by the LED write.
 
-Table packet layout, captured while editing DPI stage 2 through multiple real
-DPI values — only bytes 21/29 changed across those captures, everything else
-(including bytes 7-9 and 40-63) stayed fixed, which is why this specific
-template is trusted for stage 2 (`DPI_STAGE2_TEMPLATE` in `c18ctl.c`):
-```
-0f 00 1e 0a 19 19 05 00 00 00 64 64 01 c0 f0 03
-01 01 19 19 27 <DPI_BYTE> 5c d0 f3 5c 73 00 27 <DPI_BYTE> 5c d0
-f3 5c 73 00 1f ff 00 00 31 00 00 00 31 00 00 00
-31 31 31 00 31 00 31 00 31 31 31 31 31 31 31 31
-```
-- Byte offset 21 = X-DPI code, byte offset 29 = Y-DPI code — both `<DPI_BYTE>`,
-  looked up from the calibration table below (linear interpolation between
-  known points).
-- Bytes 7–9 and 40–63 are **not fixed in general** — they differ between
-  Profile 1 and Profile 2's *default* tables (see Restore Defaults below)
-  even though bytes 21/29 (the stage-2 DPI value) are identical between
-  profiles. Since default-table bytes 7-9/40-63 aren't `00 00 00`/the pattern
-  above, and a Restore-Defaults capture always resets *all 5 stages* at once
-  (not just stage 2), the most likely explanation is that bytes 7-9/40-63
-  encode the other 4 stages' data, while offsets 21/29 are hardwired to
-  "stage 2" regardless of which stage is currently active via opcode `0x04`.
-  **`c18ctl dpi-set` only ever writes the fixed bytes shown above (proven
-  safe for stage-2-only edits); it does not attempt to preserve or touch
-  whatever the other 4 stages' current values are** — so using it will reset
-  stages 1/3/4/5 to whatever's baked into this template, not leave them
-  alone. Not safe to extend to other stages without their own captures — see
-  Open items.
-
-### Per-stage offset claim (⚠️ not yet trusted — see Open items)
-
-A later capture pass claimed all 5 stages' X/Y offsets are located, packed
-consecutively at bytes 20-24 (X) and 28-32 (Y), one byte per stage:
+Each stage occupies one byte for X and a mirrored byte for Y, 8 bytes apart,
+at consecutive offsets:
 
 | Stage | X byte offset | Y byte offset |
 |---|---|---|
@@ -175,18 +145,43 @@ consecutively at bytes 20-24 (X) and 28-32 (Y), one byte per stage:
 | 4 | 23 | 31 |
 | 5 | 24 | 32 |
 
-**This contradicts every raw byte dump given elsewhere in this document.**
-Offsets 20, 22, 23, 24 (and their +8 mirrors 28, 30, 31, 32) have never once
-been shown to vary across any capture in this doc — in both the
-Profile-1/Profile-2 default-table dumps *and* the stage-2 multi-value edit
-template, they're always exactly `22 5c d0 f3` (or `27 5c d0 f3` in the edit
-template), i.e. they look like the fixed header/suffix of the `<marker>
-<DPI_BYTE> 5c d0 f3 5c 73 00` 8-byte chunk, not five independent per-stage
-values. Only offset 21/29 has ever been shown to change in a captured byte
-dump. No raw before/after bytes were included to substantiate the "confirmed
-by diffing stages 1/3/4/5" claim, so this table is **not implemented** —
-`c18ctl dpi-set` stays restricted to stage 2 until this is resolved with
-actual raw packet bytes for at least one non-stage-2 edit. See Open items.
+**Confirmed with raw before/after packet bytes**, not just a claimed table —
+independently re-verified byte-for-byte for this document. Source: a
+baseline capture (Profile 1 factory default) followed by 4 sequential edits
+(stage1→1000, stage3→3000, stage4→5000, stage5→7000, each applied before the
+next):
+
+```
+baseline:      0f001e0a191905040610646401c0f0030101191922395cd0f35c730022395cd0f35c73001fff0000310000003100000031313100310031003131313131313131
+stage1=1000:   0f001e0a191905040610646401c0f0030101191916395cd0f35c730016395cd0f35c73001fff0000310000003100000031313100310031003131313131313131
+stage3=3000:   0f001e0a191905040610646401c0f00301011919163945d0f35c7300163945d0f35c73001fff0000310000003100000031313100310031003131313131313131
+stage4=5000:   0f001e0a191905040610646401c0f0030101191916394573f35c730016394573f35c73001fff0000310000003100000031313100310031003131313131313131
+stage5=7000:   0f001e0a191905040610646401c0f0030101191916394573d05c730016394573d05c73001fff0000310000003100000031313100310031003131313131313131
+```
+
+Diffed step-by-step: `baseline→stage1=1000` changes only bytes 20/28
+(`0x22→0x16`); `→stage3=3000` changes only 22/30 (`0x5c→0x45`);
+`→stage4=5000` changes only 23/31 (`0xd0→0x73`); `→stage5=7000` changes only
+24/32 (`0xf3→0xd0`). Exactly one byte pair per step, nothing else in the
+64-byte payload moves at any step, and each change lands exactly where the
+offset table predicts. Byte values also cross-check against the calibration
+table below via linear interpolation: exact at 1000 DPI and 7000 DPI; 3000
+DPI comes out 1 byte low and 5000 DPI comes out 7 bytes low, both consistent
+with the calibration table's own pre-existing "not exact"/"not fully
+characterized" caveats for those DPI ranges (see below) — not a sign the
+offset table is wrong.
+
+**Bytes 7–9 and 40–63 are still not fixed/not decoded** — they differ
+between Profile 1 and Profile 2's default tables (see Restore Defaults
+below). Per the device having no readback, `c18ctl dpi-set` seeds every
+write from the *target profile's* factory-default table
+(`PROFILE1_DPI_DEFAULT`/`PROFILE2_DPI_DEFAULT` in `c18ctl.c`) and patches
+only the 2 target-stage bytes, leaving bytes 7-9/40-63 and every other
+stage's bytes exactly as they are in that default table. This means running
+`dpi-set` does **not** preserve whatever the device's *actual current*
+values are for other stages if they've been changed from factory default by
+some other means (impossible to know without readback) — it resets them
+back to the factory-default table's values. See Open items.
 
 ### DPI calibration table (stage 2, confirmed range 200–10000)
 
@@ -331,7 +326,7 @@ Windows system-menu mnemonics.
   - `event_byte` bits 0–6: timing/delay value, unit not calibrated (varies with real typing rhythm)
 - The assigning button's slot gets `type = 0x0009 | (repeat_mode<<8), value=<macro ID>` — confirmed via a direct test (existing macro ID `0x0004`) and via 3 isolated repeat-mode tests. **`c18ctl button <slot> macro <id> <mode>` implements the reference side of this** (type/value construction) but **cannot create/upload a macro** — the macro-slot-ID assignment mechanism (how the device picks an ID when a macro is first created) still isn't understood, so this only works for an ID you already know from having created the macro via the vendor software.
 
-## Armoury (burst-fire macro, "N Key") — not implemented
+## Armoury (burst-fire macro, "N Key") — protocol fully understood, not implemented in `c18ctl`
 
 A separate, unrelated sub-protocol from the keyboard-macro system above:
 burst-fire configurator (projectile count, per-projectile strike interval,
@@ -341,13 +336,20 @@ re-exposes the `type=0x0001` click submenu) opens a popup to assign either an
 Armoury preset or a macro to a button.
 
 - **Button-slot reference**: `type = 0x0c | (repeat_mode<<8)`, same 3-mode
-  enum as macros. `value` presumably a preset index — not cross-checked
-  against more than one active preset, so not implemented.
+  enum as macros. **No persistent preset index exists** — confirmed by
+  assigning two different presets ("Armoury1" then "Armoury2") to the same
+  button with the same repeat mode both times: the button-slot reference
+  (`type=0x020c, value=0x0400`) came back byte-for-byte identical for both.
+  The reference is just a fixed "this is an Armoury assignment, mode=X"
+  marker; the actual preset identity lives entirely in the freshly
+  re-uploaded fire-parameter data (below) — there's no ID because the full
+  parameter set is always resent on assignment.
 - **Fire-parameter packet**: triggered by opcode `0x0f` (`table_type=0x04`)
-  + 64-byte write. Confirmed for a single-projectile preset via an isolated
+  + 64-byte write. **Single-projectile**, confirmed via an isolated
   one-field-at-a-time test:
   ```
-  byte[0-3]: 00 01 02 f0     <- header (byte1 may be projectile count = 1)
+  byte[0-3]: 00 01 02 f0     <- fixed header (NOT projectile count — stays
+                                  "00 01" even with multiple projectiles)
   byte[4]:   0x81 (no X/Y correction) or 0x82 (X/Y correction active)
   byte[5]:   f0 (constant)
   [if active] X offset:  LE 16-bit, unsigned (50 -> 0x0032)
@@ -357,11 +359,26 @@ Armoury preset or a macro to a button.
                    confirmed: 500ms -> 0x0219, 900ms -> 0x022d
   ```
   Variable-length, presence-based layout (fields only present when active),
-  not fixed offsets like the DPI/button tables. Multi-projectile presets
-  showed a repeating per-projectile chunk structurally, but weren't
-  cross-verified byte-for-byte against this single-projectile formula.
-  **Not implemented** — out of scope without the preset-index question
-  resolved and multi-projectile support confirmed.
+  not fixed offsets like the DPI/button tables.
+- **Multi-projectile**: uses a *different* layout, not a repeat of the
+  single-projectile format — confirmed via a clean 2-projectile test with
+  fully distinct per-projectile values:
+  ```
+  byte[0-1]: 00 01                    <- fixed file header (not projectile count)
+  Then one 10-byte chunk per projectile:
+    byte[0-3]: 02 f0 82 f0             <- fixed chunk header
+    byte[4-5]: strike interval, LE 16-bit = 0xf901 + (interval_ms / 2)
+               confirmed: 40ms -> 0xf915, 80ms -> 0xf929
+    byte[6-7]: X offset, LE 16-bit, unsigned (11 -> 0x000b, 33 -> 0x0021)
+    byte[8-9]: Y correction, LE 16-bit, signed/sign-inverted (22 -> 0xffea, 44 -> 0xffd4)
+  ```
+  Distinct interval formula from single-projectile mode (`0xf901 + ms/2` vs
+  `0x0200 + ms/20`) — not an approximation of it.
+- **Not implemented in `c18ctl`** — the protocol is now fully decoded, but
+  the variable-length/presence-based packet format (different for 0/1/2+
+  projectiles) is enough added complexity that it wasn't worth building a
+  CLI command for without a concrete use case. Could be added later using
+  the encoding above.
 
 ## Restore Defaults (raw capture, for reference)
 
@@ -425,14 +442,13 @@ byte[48-63]: 31 31 31 00 31 00 31 00 31 31 31 31 31 31 31 31
 ```
 
 Differences: bytes 7-9 (`01 01 03` vs `04 06 10`) and most of bytes 40-63.
-Both profiles agree on bytes 21/29 (`0x39`), so the *active/stage-2* DPI
-value is the same factory default for both profiles — the differing bytes
-are something else per-profile (possibly per-stage flags, or all-5-stage
-values, given each profile can have its own independent 5-stage DPI ladder).
-**Still not decoded** — see Open items. Note this default table does *not*
-match `DPI_STAGE2_TEMPLATE` (the one `c18ctl dpi-set` uses) at bytes 7-9/40-63
-— that template came from a live stage-2-only edit capture, this one from a
-full Restore Defaults reset; they agree only at offsets 21/29.
+Both profiles agree on bytes 21/29 (`0x39`), so the *stage-2* DPI value is
+the same factory default for both profiles — the differing bytes are
+something else per-profile, still not decoded (they are *not* other DPI
+stages' data — the per-stage offsets are now confirmed at 20/22/23/24 and
+28/30/31/32, see the DPI section above, and those don't overlap bytes
+7-9/40-63). These two tables (`PROFILE1_DPI_DEFAULT`/`PROFILE2_DPI_DEFAULT`
+in `c18ctl.c`) are what `c18ctl dpi-set` seeds every write from.
 
 ## Acceleration
 
@@ -448,33 +464,25 @@ Resolved across this round of captures: the earlier byte-count issues in the
 default-table captures (61/58 bytes instead of 64, and the button table's
 missing bytes 40-63) were transcription gaps, not real protocol gaps;
 Button 1's "marker+tag" was a misreading, not a real quirk (it's just Button
-1's own type/value pair, unchanged in earlier captures); and buttons 9-11
-were simply never tested before. All 11 buttons, the native-click value
-table, keyboard-shortcut modifier encoding, Combo Key, and Exact Control are
-now implemented in `c18ctl button`. Remaining open items:
+1's own type/value pair, unchanged in earlier captures); buttons 9-11 were
+simply never tested before; and the DPI per-stage offset table (which this
+document previously flagged as an unverified claim contradicted by every raw
+byte dump then available) is now backed by actual raw before/after packet
+bytes, independently re-verified — see the DPI section above. All 11
+buttons, the native-click value table, keyboard-shortcut modifier encoding,
+Combo Key, Exact Control, and all 5 DPI stages are now implemented in
+`c18ctl`. Remaining open items:
 
-- **⚠️ DPI per-stage offset claim needs raw-byte verification before
-  implementation.** A capture pass claims stages 1/3/4/5's X/Y DPI bytes live
-  at offsets 20/22/23/24 (X) and 28/30/31/32 (Y), packed consecutively next
-  to the known stage-2 offset 21/29. But every raw dump actually shown in
-  this document — both profile defaults and the stage-2 multi-value edit
-  template — has those exact offsets fixed at `22 5c d0 f3` / `27 5c d0 f3`
-  in every single capture, never varying. That pattern looks like the fixed
-  header+suffix of the `<header> <DPI_BYTE> 5c d0 f3 5c 73 00` chunk, not
-  five independent per-stage values, and no raw before/after bytes were
-  included to substantiate the "confirmed by diffing stages 1/3/4/5" claim.
-  **Need**: the actual raw packet bytes (before/after) from editing DPI stage
-  1 (or any of 3/4/5) through at least two different DPI values, the same
-  rigor already applied to stage 2. Until then `c18ctl dpi-set` stays
-  restricted to stage 2. See the "Per-stage offset claim" callout in the DPI
-  section above.
 - Bytes 7–9 and 40–63 of the **DPI table** packet: confirmed *not* fixed
-  (differ between profiles' Restore-Defaults tables, and differ from the
-  stage-2-edit template) — still not decoded, possibly related to the
-  per-stage question above. `c18ctl dpi-set` does not attempt to preserve
-  whatever the device's current values are here (it can't — no readback), so
-  it will reset whatever's encoded there to the stage-2-edit template's
-  values rather than leave them untouched.
+  (differ between profiles' Restore-Defaults tables) — still not decoded.
+  Since the per-stage offsets (20-24/28-32) are now confirmed and don't
+  overlap this region, these bytes are something else entirely — two
+  hypotheses ruled out: not the "Configuration sensitivity level" checkboxes
+  (confirmed single-select, functionally identical to the already-mapped
+  active-stage selector) and not the profile name/description text
+  (confirmed entirely host-side). `c18ctl dpi-set` preserves these bytes
+  as-is from the target profile's default table on every write (it can't
+  do anything smarter without readback).
 - Bytes 28–31 and 48–63 of the **button-remap** packet: confirmed
   fixed/identical across both profiles' factory defaults and unchanged
   through the full 11-button sweep, so likely genuinely reserved — but not
@@ -493,7 +501,9 @@ now implemented in `c18ctl button`. Remaining open items:
 - Macro-slot-ID assignment mechanism (how the device picks an ID when a
   macro is first created) — not understood, blocks macro *upload*
   (referencing an already-known ID is implemented, see Button remapping).
-- **Armoury**: repeat-mode encoding resolved (shares the macro's 3-mode
-  enum), but whether `value` encodes a preset index when multiple presets
-  exist isn't cross-checked, and multi-projectile fire-parameter encoding
-  isn't confirmed byte-for-byte. Not implemented.
+- **Armoury**: protocol fully decoded (repeat-mode encoding, confirmed no
+  persistent preset index, single- and multi-projectile fire-parameter
+  encoding with distinct interval formulas) — see the Armoury section. Not
+  implemented as a `c18ctl` command; the variable-length/presence-based
+  packet format wasn't worth the added CLI surface without a concrete use
+  case, not because anything's still unknown.

@@ -53,21 +53,38 @@ static const unsigned char EFFECT_TAIL_DEFAULT[24] = {
   0x31,0x00,0x31, 0x00,0x31,0x31, 0x31,0x31,0x31, 0x31,0x31,0x31
 };
 
-// DPI table template, captured while editing DPI stage 2 through multiple real
-// values (only bytes 21 and 29 — the X/Y DPI code — changed across those captures;
-// everything else here, including bytes 7-9 and 40-63, stayed fixed). Those two
-// regions are known to differ for other stages/contexts (see PROTOCOL.md), so this
-// template is only validated for stage 2. DPI_BYTE placeholder = 0x04 (200 DPI).
-static const unsigned char DPI_STAGE2_TEMPLATE[64] = {
-  0x0f,0x00,0x1e,0x0a,0x19,0x19,0x05,0x00,0x00,0x00,0x64,0x64,0x01,0xc0,0xf0,0x03,
-  0x01,0x01,0x19,0x19,0x27,0x04,0x5c,0xd0,0xf3,0x5c,0x73,0x00,0x27,0x04,0x5c,0xd0,
+// Per-profile factory-default DPI table, script-verified byte-for-byte from a
+// real capture (Restore Defaults). Used as the base for every DPI-table write:
+// since the device has no readback, a driver must seed from a known-good full
+// table and patch only the 2 target bytes for whichever stage is being changed
+// (see PROTOCOL.md's "Driver implication"). Bytes 7-9 and 40-63 are still
+// undecoded and differ per profile, so they're preserved as-is from here rather
+// than reconstructed.
+static const unsigned char PROFILE1_DPI_DEFAULT[64] = {
+  0x0f,0x00,0x1e,0x0a,0x19,0x19,0x05,0x04,0x06,0x10,0x64,0x64,0x01,0xc0,0xf0,0x03,
+  0x01,0x01,0x19,0x19,0x22,0x39,0x5c,0xd0,0xf3,0x5c,0x73,0x00,0x22,0x39,0x5c,0xd0,
   0xf3,0x5c,0x73,0x00,0x1f,0xff,0x00,0x00,0x31,0x00,0x00,0x00,0x31,0x00,0x00,0x00,
   0x31,0x31,0x31,0x00,0x31,0x00,0x31,0x00,0x31,0x31,0x31,0x31,0x31,0x31,0x31,0x31
 };
+static const unsigned char PROFILE2_DPI_DEFAULT[64] = {
+  0x0f,0x00,0x1e,0x0a,0x19,0x19,0x05,0x01,0x01,0x03,0x64,0x64,0x01,0xc0,0xf0,0x03,
+  0x01,0x01,0x19,0x19,0x22,0x39,0x5c,0xd0,0xf3,0x5c,0x73,0x00,0x22,0x39,0x5c,0xd0,
+  0xf3,0x5c,0x73,0x00,0x1f,0xff,0x00,0x00,0x00,0x00,0x31,0x00,0x00,0x31,0x00,0x00,
+  0x31,0x00,0x00,0x31,0x00,0x00,0x31,0x00,0x00,0x31,0x00,0x00,0x31,0x00,0x00,0x31
+};
 
-// Byte offsets of the X/Y DPI code within DPI_STAGE2_TEMPLATE / the DPI table packet.
-#define DPI_X_OFFSET 21
-#define DPI_Y_OFFSET 29
+// Byte offsets of each DPI stage's X/Y code within the DPI table packet.
+// Confirmed by editing stages 1/3/4/5 individually and diffing each write
+// against the previous state: exactly one X/Y byte pair changes per edit, at
+// consecutive offsets, 8 bytes apart (X block starts at 20, Y block at 28).
+static const struct { int x_off, y_off; } DPI_STAGE_OFFSETS[6] = {
+  /* [0] unused */ {0, 0},
+  /* stage 1 */    {20, 28},
+  /* stage 2 */    {21, 29},
+  /* stage 3 */    {22, 30},
+  /* stage 4 */    {23, 31},
+  /* stage 5 */    {24, 32},
+};
 
 // DPI value -> device byte code. Non-linear sensor register encoding; use linear
 // interpolation between confirmed points (matches doc guidance and exactly
@@ -333,11 +350,12 @@ static void build_payload_mode_speed(unsigned char payload[64], unsigned char mo
   memcpy(payload + 40, EFFECT_TAIL_DEFAULT, 24);
 }
 
-static void build_payload_dpi_stage2(unsigned char payload[64], int dpi) {
-  memcpy(payload, DPI_STAGE2_TEMPLATE, 64);
+static void build_payload_dpi_stage(unsigned char payload[64], int profile, int stage, int dpi) {
+  if (stage < 1 || stage > 5) die("DPI stage must be 1-5");
+  memcpy(payload, profile == 2 ? PROFILE2_DPI_DEFAULT : PROFILE1_DPI_DEFAULT, 64);
   unsigned char b = dpi_to_byte(dpi);
-  payload[DPI_X_OFFSET] = b;
-  payload[DPI_Y_OFFSET] = b;
+  payload[DPI_STAGE_OFFSETS[stage].x_off] = b;
+  payload[DPI_STAGE_OFFSETS[stage].y_off] = b;
 }
 
 // USB HID Keyboard/Keypad usage page (standard, not device-specific) — matches
@@ -425,7 +443,7 @@ static void usage(void) {
     "  sudo ./c18ctl profile <1|2>\n"
     "  sudo ./c18ctl polling <125|250|500|1000> [profile]\n"
     "  sudo ./c18ctl dpi-stage <1-5> [profile]\n"
-    "  sudo ./c18ctl dpi-set <stage=2> <dpi 200-10000> [profile]\n"
+    "  sudo ./c18ctl dpi-set <stage 1-5> <dpi 200-10000> [profile]\n"
     "  sudo ./c18ctl button <slot 1-11> off [profile]\n"
     "  sudo ./c18ctl button <slot 1-11> key <a-z0-9|0xHH> [profile]\n"
     "  sudo ./c18ctl button <slot 1-11> media <volup|voldown|playpause|stop|mute|next|prev|mediaplayer|mycomputer|home|0xHH> [profile]\n"
@@ -446,8 +464,9 @@ static void usage(void) {
     "macro only *references* an existing macro ID created via the vendor\n"
     "software — this tool cannot upload/create macros (see PROTOCOL.md).\n"
     "\n"
-    "dpi-set only supports stage 2 for now — see PROTOCOL.md, there's an open\n"
-    "question about whether the other 4 stages' offsets are correctly located.\n"
+    "dpi-set writes the whole DPI table, seeded from the profile's factory\n"
+    "default (bytes 7-9/40-63, still undecoded, are preserved as-is from\n"
+    "there) with only the target stage's 2 bytes patched.\n"
     "Each `button` call writes the WHOLE button table, resetting any other\n"
     "previously-set button back to factory default (no readback exists).\n"
     "See PROTOCOL.md for details and open items.\n"
@@ -507,10 +526,9 @@ int main(int argc, char **argv) {
     profile = parse_profile(argc >= 4 ? argv[3] : NULL);
   } else if (streq(cmd, "dpi-set")) {
     if (argc < 4) { usage(); return 2; }
-    if (atoi(argv[2]) != 2) die("Only DPI stage 2 is supported by dpi-set right now — see PROTOCOL.md");
     kind = KIND_DPI_TABLE;
-    build_payload_dpi_stage2(payload, atoi(argv[3]));
     profile = parse_profile(argc >= 5 ? argv[4] : NULL);
+    build_payload_dpi_stage(payload, profile, atoi(argv[2]), atoi(argv[3]));
   } else if (streq(cmd, "button")) {
     if (argc < 4) { usage(); return 2; }
     int slot = atoi(argv[2]);
