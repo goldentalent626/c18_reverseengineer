@@ -94,11 +94,12 @@ static unsigned char dpi_to_byte(int dpi) {
   return DPI_CALIB[DPI_CALIB_N - 1].byte;
 }
 
-// Default button table, script-verified byte-for-byte from a real capture. Bytes
-// 40-63 confirmed fixed/identical across both profiles' factory defaults (reserved,
-// not additional button slots). Used as the base for every button-table write,
-// since the device protocol has no readback: writing one button resets any other
-// previously-customized button back to this factory default.
+// Default button table, script-verified byte-for-byte from a real capture. All
+// 11 buttons confirmed against the vendor software's default-layout diagram.
+// Bytes 28-31 and 48-63 are a fixed/reserved trailer (confirmed unchanged across
+// every capture, including a full 11-button sweep). Used as the base for every
+// button-table write, since the device protocol has no readback: writing one
+// button resets any other previously-customized button back to this default.
 static const unsigned char BUTTON_DEFAULT_TABLE[64] = {
   0x01,0x00,0xf0,0x00,0x01,0x00,0xf1,0x00,0x01,0x00,0xf2,0x00,0x01,0x00,0xf4,0x00,
   0x01,0x00,0xf3,0x00,0x07,0x00,0x03,0x00,0x00,0x00,0x2c,0x00,0x00,0x00,0x00,0x00,
@@ -107,18 +108,24 @@ static const unsigned char BUTTON_DEFAULT_TABLE[64] = {
 };
 
 // Byte offset of a button slot's [type LE][value LE] pair within the button table.
-// Button 2 has an extra marker+tag prefix (see PROTOCOL.md), so its type/value
-// pair is at offset 4, not 0.
+// All 11 physical buttons use the identical 4-byte [type][value] format, no
+// exceptions (an earlier pass mistook Button 1's own pair for a "marker+tag
+// prefix" on Button 2, since Button 1 never changed in those captures). Button
+// 11 sits out of numeric sequence, between 6 and 7.
 static int button_slot_offset(int slot) {
   switch (slot) {
-    case 2: return 4;
-    case 3: return 8;
-    case 4: return 12;
-    case 5: return 16;
-    case 6: return 20;
-    case 7: return 32;
-    case 8: return 36;
-    default: die("Button slot must be 2-8"); return -1;
+    case  1: return  0;
+    case  2: return  4;
+    case  3: return  8;
+    case  4: return 12;
+    case  5: return 16;
+    case  6: return 20;
+    case 11: return 24;
+    case  7: return 32;
+    case  8: return 36;
+    case  9: return 40;
+    case 10: return 44;
+    default: die("Button slot must be 1-11"); return -1;
   }
 }
 
@@ -355,8 +362,54 @@ static unsigned short parse_media(const char *s) {
   if (streq(s, "voldown"))   return 0xea;
   if (streq(s, "playpause")) return 0xcd;
   if (streq(s, "stop"))      return 0xb7;
+  if (streq(s, "mute"))      return 0xe2;
+  if (streq(s, "next"))      return 0xb5;
+  if (streq(s, "prev"))      return 0xb6;
+  if (streq(s, "mediaplayer")) return 0x0183;
+  if (streq(s, "mycomputer"))  return 0x0194;
+  if (streq(s, "home"))        return 0x0223;
   if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) return (unsigned short)strtol(s, NULL, 16);
-  die("media must be one of: volup voldown playpause stop, or 0xHH");
+  die("media must be one of: volup voldown playpause stop mute next prev "
+      "mediaplayer mycomputer home, or 0xHH");
+  return 0;
+}
+
+// type=0x0001 native mouse-click function. All 5 values confirmed against the
+// vendor software's default-button-layout diagram (see PROTOCOL.md).
+static unsigned short parse_click(const char *s) {
+  if (streq(s, "left"))   return 0xf0;
+  if (streq(s, "menu"))   return 0xf1;
+  if (streq(s, "middle")) return 0xf2;
+  if (streq(s, "back"))   return 0xf3;
+  if (streq(s, "forward"))return 0xf4;
+  if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) return (unsigned short)strtol(s, NULL, 16);
+  die("click must be one of: left menu middle back forward, or 0xHH");
+  return 0;
+}
+
+// USB HID keyboard modifier bitmask, shifted into type's high byte
+// (type = modifier_bitmask << 8). Any combination of the letters c/s/a/w,
+// or "-"/"none" for no modifier.
+static unsigned char parse_mods(const char *s) {
+  if (streq(s, "-") || streq(s, "none")) return 0x00;
+  unsigned char mask = 0;
+  for (const char *p = s; *p; p++) {
+    switch (*p) {
+      case 'c': case 'C': mask |= 0x01; break; // Ctrl
+      case 's': case 'S': mask |= 0x02; break; // Shift
+      case 'a': case 'A': mask |= 0x04; break; // Alt
+      case 'w': case 'W': mask |= 0x08; break; // Win/GUI
+      default: die("mods must be made of c/s/a/w (Ctrl/Shift/Alt/Win), or -/none");
+    }
+  }
+  return mask;
+}
+
+static unsigned char parse_macro_mode(const char *s) {
+  if (streq(s, "once"))               return 0x00;
+  if (streq(s, "until-interrupted"))  return 0x01;
+  if (streq(s, "until-released"))     return 0x02;
+  die("macro mode must be: once|until-interrupted|until-released");
   return 0;
 }
 
@@ -373,18 +426,30 @@ static void usage(void) {
     "  sudo ./c18ctl polling <125|250|500|1000> [profile]\n"
     "  sudo ./c18ctl dpi-stage <1-5> [profile]\n"
     "  sudo ./c18ctl dpi-set <stage=2> <dpi 200-10000> [profile]\n"
-    "  sudo ./c18ctl button <slot 2-8> off [profile]\n"
-    "  sudo ./c18ctl button <slot 2-8> key <a-z0-9|0xHH> [profile]\n"
-    "  sudo ./c18ctl button <slot 2-8> media <volup|voldown|playpause|stop|0xHH> [profile]\n"
-    "  sudo ./c18ctl button <slot 2-8> dpi-up|dpi-down|dpi-cycle [profile]\n"
-    "  sudo ./c18ctl button <slot 2-8> profile-up|profile-down|profile-cycle [profile]\n"
-    "  sudo ./c18ctl button <slot 2-8> native <0xHH> [profile]\n"
+    "  sudo ./c18ctl button <slot 1-11> off [profile]\n"
+    "  sudo ./c18ctl button <slot 1-11> key <a-z0-9|0xHH> [profile]\n"
+    "  sudo ./c18ctl button <slot 1-11> media <volup|voldown|playpause|stop|mute|next|prev|mediaplayer|mycomputer|home|0xHH> [profile]\n"
+    "  sudo ./c18ctl button <slot 1-11> click <left|menu|middle|back|forward|0xHH> [profile]\n"
+    "  sudo ./c18ctl button <slot 1-11> dpi-up|dpi-down|dpi-cycle [profile]\n"
+    "  sudo ./c18ctl button <slot 1-11> profile-up|profile-down|profile-cycle [profile]\n"
+    "  sudo ./c18ctl button <slot 1-11> shortcut <mods> <key> [profile]\n"
+    "  sudo ./c18ctl button <slot 1-11> shortcut2 <mods> <key1> <key2> [profile]\n"
+    "  sudo ./c18ctl button <slot 1-11> combo <times> <delay_ms> [profile]\n"
+    "  sudo ./c18ctl button <slot 1-11> exact-control [profile]\n"
+    "  sudo ./c18ctl button <slot 1-11> macro <0xHH id> <once|until-interrupted|until-released> [profile]\n"
     "\n"
     "Colors: red green blue yellow purple cyan white off\n"
+    "mods: any combination of c/s/a/w (Ctrl/Shift/Alt/Win), or -/none.\n"
+    "shortcut2's key2 is sent plain (no modifier) right after key1.\n"
+    "combo is Double-click/Three-click/Fire-button's shared mechanism; delay_ms\n"
+    "is clamped to 127 (device's confirmed max, a signed byte).\n"
+    "macro only *references* an existing macro ID created via the vendor\n"
+    "software — this tool cannot upload/create macros (see PROTOCOL.md).\n"
     "\n"
-    "dpi-set only supports stage 2 for now (the only stage with a validated\n"
-    "capture). Each `button` call writes the WHOLE button table, resetting any\n"
-    "other previously-set button back to factory default (no readback exists).\n"
+    "dpi-set only supports stage 2 for now — see PROTOCOL.md, there's an open\n"
+    "question about whether the other 4 stages' offsets are correctly located.\n"
+    "Each `button` call writes the WHOLE button table, resetting any other\n"
+    "previously-set button back to factory default (no readback exists).\n"
     "See PROTOCOL.md for details and open items.\n"
   );
 }
@@ -476,10 +541,46 @@ int main(int argc, char **argv) {
       btype = 0x0008; bvalue = 0x0002; profile_arg = (argc >= 5) ? argv[4] : NULL;
     } else if (streq(action, "profile-cycle")) {
       btype = 0x0008; bvalue = 0x0003; profile_arg = (argc >= 5) ? argv[4] : NULL;
-    } else if (streq(action, "native")) {
+    } else if (streq(action, "click")) {
       if (argc < 5) { usage(); return 2; }
-      btype = 0x0001; bvalue = (unsigned short)strtol(argv[4], NULL, 16);
+      btype = 0x0001; bvalue = parse_click(argv[4]);
       profile_arg = (argc >= 6) ? argv[5] : NULL;
+    } else if (streq(action, "shortcut")) {
+      if (argc < 6) { usage(); return 2; }
+      unsigned char mods = parse_mods(argv[4]);
+      btype = (unsigned short)(mods << 8);
+      bvalue = parse_key(argv[5]);
+      profile_arg = (argc >= 7) ? argv[6] : NULL;
+    } else if (streq(action, "shortcut2")) {
+      if (argc < 7) { usage(); return 2; }
+      unsigned char mods = parse_mods(argv[4]);
+      btype = (unsigned short)(mods << 8);
+      unsigned short key1 = parse_key(argv[5]);
+      unsigned short key2 = parse_key(argv[6]);
+      bvalue = (unsigned short)(key1 | (key2 << 8));
+      profile_arg = (argc >= 8) ? argv[7] : NULL;
+    } else if (streq(action, "combo")) {
+      if (argc < 6) { usage(); return 2; }
+      int times = atoi(argv[4]);
+      int delay = atoi(argv[5]);
+      if (times < 0 || times > 255) die("combo times must be 0-255");
+      if (delay < 0) die("combo delay_ms must be >= 0");
+      if (delay > 127) {
+        fprintf(stderr, "note: delay clamped to 127ms (device's confirmed max, a signed byte)\n");
+        delay = 127;
+      }
+      btype = 0xf00a;
+      bvalue = (unsigned short)((delay & 0xff) | ((times & 0xff) << 8));
+      profile_arg = (argc >= 7) ? argv[6] : NULL;
+    } else if (streq(action, "exact-control")) {
+      btype = 0x000b; bvalue = 0x0f0f;
+      profile_arg = (argc >= 5) ? argv[4] : NULL;
+    } else if (streq(action, "macro")) {
+      if (argc < 6) { usage(); return 2; }
+      unsigned char mode = parse_macro_mode(argv[5]);
+      btype = (unsigned short)(0x0009 | (mode << 8));
+      bvalue = (unsigned short)strtol(argv[4], NULL, 16);
+      profile_arg = (argc >= 7) ? argv[6] : NULL;
     } else {
       usage();
       return 2;

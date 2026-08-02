@@ -56,11 +56,13 @@ commands (see "LED / RGB" below) — same formula, same transaction wrapper.
 | `0x04` | Set active DPI stage | `04 <profile#> <stage 1-5> 00 00 00 00 <checksum>` | Implemented (`c18ctl dpi-stage`) |
 | `0x09` | Macro event data | `09 <event> <keycode> ...` (see Macros below) | Not implemented — macro-slot-ID assignment isn't understood (see Open items) |
 | `0x0c` | Prepare to write DPI table | `0c <profile#> 80 00 00 00 00 <checksum>` — precedes the DPI-table primer+data writes on endpoint `0x04` | Implemented — this is the same "prepare table" step the LED command sequence already used (previously named `FEAT_ARM`). The 64-byte DPI table write itself is implemented for **stage 2 only** (`c18ctl dpi-set 2 <dpi>`) — see Open items for stages 1/3/4/5. |
-| `0x0d` | Prepare to write button table | `0d <profile#> 80 00 00 00 00 <checksum>` — precedes the button-table write on endpoint `0x04` (also seen ahead of macro data uploads — likely a generic "prepare next table write" trigger, not table-specific) | Implemented (`c18ctl button`) |
+| `0x0d` | Prepare to write button table | `0d <profile#> 80 00 00 00 00 <checksum>` — precedes the button-table write on endpoint `0x04` | Implemented (`c18ctl button`) |
+| `0x0f` | Prepare to upload extended per-reference data | `0f <table_type> 80 00 00 00 00 <checksum>` — general-purpose, not tied to one feature. `table_type=0x04` seen preceding both Armoury fire-parameter uploads and macro keyboard-event-data uploads (assigning any macro, even an unchanged existing one, re-triggers this and re-sends the macro's full data) | Not implemented (macro upload / Armoury fire-parameter upload out of scope — see Open items) |
 
 Byte1 of opcodes `0x03`/`0x04`/`0x0c`/`0x0d` is the **target profile number**,
 confirmed by a Restore Defaults capture that exercised these opcodes on
-Profile 2 and got byte1=`02` throughout.
+Profile 2 and got byte1=`02` throughout. (`0x0f`'s second byte is a *table
+type* selector, not a profile number — different convention.)
 
 ### LED / RGB — cross-reference to previously-used names
 
@@ -160,6 +162,32 @@ f3 5c 73 00 1f ff 00 00 31 00 00 00 31 00 00 00
   alone. Not safe to extend to other stages without their own captures — see
   Open items.
 
+### Per-stage offset claim (⚠️ not yet trusted — see Open items)
+
+A later capture pass claimed all 5 stages' X/Y offsets are located, packed
+consecutively at bytes 20-24 (X) and 28-32 (Y), one byte per stage:
+
+| Stage | X byte offset | Y byte offset |
+|---|---|---|
+| 1 | 20 | 28 |
+| 2 | 21 | 29 |
+| 3 | 22 | 30 |
+| 4 | 23 | 31 |
+| 5 | 24 | 32 |
+
+**This contradicts every raw byte dump given elsewhere in this document.**
+Offsets 20, 22, 23, 24 (and their +8 mirrors 28, 30, 31, 32) have never once
+been shown to vary across any capture in this doc — in both the
+Profile-1/Profile-2 default-table dumps *and* the stage-2 multi-value edit
+template, they're always exactly `22 5c d0 f3` (or `27 5c d0 f3` in the edit
+template), i.e. they look like the fixed header/suffix of the `<marker>
+<DPI_BYTE> 5c d0 f3 5c 73 00` 8-byte chunk, not five independent per-stage
+values. Only offset 21/29 has ever been shown to change in a captured byte
+dump. No raw before/after bytes were included to substantiate the "confirmed
+by diffing stages 1/3/4/5" claim, so this table is **not implemented** —
+`c18ctl dpi-set` stays restricted to stage 2 until this is resolved with
+actual raw packet bytes for at least one non-stage-2 edit. See Open items.
+
 ### DPI calibration table (stage 2, confirmed range 200–10000)
 
 Not a single linear formula — non-linear/multi-region sensor register
@@ -189,6 +217,23 @@ Written as a 64-byte packet on interrupt endpoint `0x04` (no primer packet,
 unlike the DPI table). One data-carrying submit + one zero-length completion
 IRP.
 
+**All 11 buttons confirmed** via a full sweep — every button assigned a
+unique test key and diffed against the previous state, then cross-checked
+byte-for-byte against the vendor software's default-button-layout diagram
+(11/11 matched).
+
+**Correction from an earlier capture pass**: Button 1 (the main left-click
+button) **is remappable** and occupies its own slot — this wasn't tested
+until later. What was originally read as "Button 2's marker+tag prefix"
+(`[marker=0x0001][tag=0x00f0]`) was actually **Button 1's own `[type][value]`
+pair** — it simply never changed in earlier captures (stuck at its factory
+default, Left Click) so it looked like a constant prefix rather than live
+data. There is no marker/tag concept — every button uses the identical
+`[type][value]` 4-byte format. (`c18ctl.c`'s offsets for buttons 2-8 didn't
+actually need to change from the earlier, differently-reasoned version — they
+came out numerically identical either way — but slots 1, 9, 10, 11 were
+entirely missing before this correction.)
+
 **Caveat**: the device protocol has no readback, so every `c18ctl button`
 call sends the *entire* 64-byte table built from the factory-default template
 (`BUTTON_DEFAULT_TABLE` in `c18ctl.c`) with only the target slot patched —
@@ -200,31 +245,75 @@ track the full current table client-side across calls to avoid this.
 
 | Bytes | Button | Format |
 |---|---|---|
-| 0–7 | Button 2 | `[marker=0x0001 LE][tag=0x00f0 LE][type LE][value LE]` — always full 4-word form |
+| 0–3 | Button 1 (main click) | `[type LE][value LE]` |
+| 4–7 | Button 2 | `[type LE][value LE]` |
 | 8–11 | Button 3 | `[type LE][value LE]` |
 | 12–15 | Button 4 | `[type LE][value LE]` |
 | 16–19 | Button 5 | `[type LE][value LE]` |
 | 20–23 | Button 6 | `[type LE][value LE]` |
-| 24–31 | (fixed trailer, not a button) | |
+| 24–27 | **Button 11** | `[type LE][value LE]` — out of numeric sequence, sits here rather than after button 10 |
+| 28–31 | (fixed trailer) | `00 00 00 00` |
 | 32–35 | Button 7 | `[type LE][value LE]` |
 | 36–39 | Button 8 | `[type LE][value LE]` |
-| 40–63 | (fixed trailer/reserved — not mapped to a button; confirmed identical across both profiles' factory defaults, see Default button table below) | |
+| 40–43 | Button 9 | `[type LE][value LE]` |
+| 44–47 | Button 10 | `[type LE][value LE]` |
+| 48–63 | (fixed trailer/reserved, 16 bytes) | unchanged in every capture, including the full 11-button sweep |
 
-All multi-byte fields are little-endian 16-bit words. Button 2 is the sole
-exception with an explicit marker+tag prefix; all others are addressed purely
-by position. Untouched slots retain stale/leftover bytes from whatever was
-last written (or factory default) — not meaningful until first written.
+All multi-byte fields are little-endian 16-bit words. Every button uses the
+identical `[type][value]` format — no exceptions. Untouched slots retain
+stale/leftover bytes from whatever was last written (or factory default) —
+not meaningful until first written.
+
+### Confirmed factory defaults for all 11 buttons
+
+Cross-verified against the vendor software's default-layout diagram — every
+one matches:
+
+| Button | Bytes | Default | type/value |
+|---|---|---|---|
+| 1 | 0-3 | Left Click | `type=0x0001, value=0xf0` |
+| 2 | 4-7 | Menu | `type=0x0001, value=0xf1` |
+| 3 | 8-11 | Wheel Click | `type=0x0001, value=0xf2` |
+| 4 | 12-15 | IE Forward | `type=0x0001, value=0xf4` |
+| 5 | 16-19 | IE Backward | `type=0x0001, value=0xf3` |
+| 6 | 20-23 | DPI Cycle | `type=0x0007, value=0x0003` |
+| 11 | 24-27 | Space | `type=0x0000, value=0x2c` |
+| 7 | 32-35 | "w" | `type=0x0000, value=0x1a` |
+| 8 | 36-39 | "s" | `type=0x0000, value=0x16` |
+| 9 | 40-43 | "a" | `type=0x0000, value=0x04` |
+| 10 | 44-47 | "d" | `type=0x0000, value=0x07` |
 
 ### Type/value table
 
-| Type | Category | Value meaning |
+| Type | Category | Value meaning | Implemented as |
+|---|---|---|---|
+| `0x0000` | Keyboard key | USB HID keyboard usage code. `0x00`=disabled/no-op, `0x1E`="1", `0x1F`="2", `0x04`="a"..`0x1D`="z". Matches the standard USB HID Keyboard/Keypad usage page — not device-specific. | `button <slot> key <a-z0-9\|0xHH>` |
+| `0x0003` | Consumer/media control | Standard USB HID Consumer Page usage code. `0xE9`=Volume Up, `0xEA`=Volume Down, `0xCD`=Play/Pause, `0xB7`=Stop, `0xE2`=Mute, `0xB5`=Next Track, `0xB6`=Previous Track, `0x0183`=Open Player, `0x0194`=My Computer, `0x0223`=www Home. | `button <slot> media <name\|0xHH>` |
+| `0x0001` | Native/built-in mouse-click function | `0xf0`=Left Click, `0xf1`=Menu (context menu), `0xf2`=Wheel Click (Middle), `0xf3`=Back, `0xf4`=Forward. Confirmed via live explicit assignment plus cross-reference against the factory-default diagram. | `button <slot> click <left\|menu\|middle\|back\|forward\|0xHH>` |
+| `0x0007` | DPI function | `0x0001`=DPI Up, `0x0002`=DPI Down, `0x0003`=DPI Cycle | `button <slot> dpi-up\|dpi-down\|dpi-cycle` |
+| `0x0008` | Profile function | `0x0001`=Profile Up, `0x0002`=Profile Down, `0x0003`=Profile Cycle | `button <slot> profile-up\|profile-down\|profile-cycle` |
+| `(modifier<<8)` | Keyboard shortcut | `type`'s high byte is a USB HID keyboard modifier bitmask (low byte `0x00`): Ctrl=`0x01`, Shift=`0x02`, Alt=`0x04`, Win=`0x08`, freely OR'd together. `value`'s low byte is the primary key (held with the modifier); high byte is an optional second plain keystroke sent right after (`0x00` = none). See "Modifier encoding" below. | `button <slot> shortcut <mods> <key>` / `shortcut2 <mods> <key1> <key2>` |
+| `0x0009 \| (repeat_mode<<8)` | Macro reference | `value` = macro slot ID assigned when the macro was created (e.g. `0x1f`, `0x22`) — not a fixed/predictable ID. `repeat_mode`: `0x00`="repeat N or interrupt", `0x01`="repeat until interrupted", `0x02`="repeat until released". This *references* an existing macro; this tool cannot create/upload one (see Macros below). | `button <slot> macro <0xHH id> <once\|until-interrupted\|until-released>` |
+| `0xf00a` | Combo Key (Double-click / Three Click / Fire Button — all the same mechanism) | `value` = `[byte6: Delay ms, signed, capped ~127][byte7: Times, repeat count 0-255]`. Double-click = Delay 50ms/Times 2, Three Click = Delay 22ms/Times 3. | `button <slot> combo <times> <delay_ms>` |
+| `0x000b` | Exact Control | Fixed `value=0x0f0f` — no settings dialog exists, this is the full encoding. Functional meaning unclear, but the wire encoding is settled. | `button <slot> exact-control` |
+| `0x0c \| (repeat_mode<<8)` | Armoury (burst-fire preset) reference | Same 3-mode repeat enum as macros. `value` presumably a preset index, but not cross-checked against more than one preset. | **Not implemented** — preset-index semantics unconfirmed, see Open items |
+
+### Modifier encoding (confirmed)
+
+| Modifier | Bit | `type` value |
 |---|---|---|
-| `0x0000` | Keyboard key | USB HID keyboard usage code. `0x00`=disabled/no-op, `0x1E`="1", `0x1F`="2", `0x04`="a", `0x05`="b", `0x06`="c", `0x21`="4", `0x22`="5", `0x23`="6". Numpad number keys get normalized to the same codes as top-row numbers. (These match the standard USB HID Keyboard/Keypad usage page — not device-specific.) |
-| `0x0003` | Consumer/media control | Standard USB HID Consumer Page usage code. `0xE9`=Volume Up, `0xEA`=Volume Down, `0xCD`=Play/Pause, `0xB7`=Stop. |
-| `0x0007` | DPI function | `0x0001`=DPI Up, `0x0002`=DPI Down, `0x0003`=DPI Cycle |
-| `0x0008` | Profile function | `0x0001`=Profile Up, `0x0002`=Profile Down, `0x0003`=Profile Cycle |
-| `0x0009` | Macro reference | `value` = macro slot ID assigned when the macro was created (e.g. `0x1f`, `0x22`) — not a fixed/predictable ID |
-| `0x0001` | Native/built-in mouse-click function (discovered via factory defaults) | `value` in range `0xf0`-`0xf4` seen so far (240-244). Not precisely mapped to specific actions yet — plausible guess is Left/Right/Middle/Forward/Back click, since these are the factory defaults for buttons 2-5. Needs a dedicated test (explicitly assign "Left Click" etc. via the software UI and observe the byte) to confirm exact mapping. |
+| (none) | — | `0x0000` |
+| Ctrl | bit0 (`0x01`) | `0x0100` |
+| Shift | bit1 (`0x02`) | `0x0200` |
+| Alt | bit2 (`0x04`) | `0x0400` |
+| Win/GUI | bit3 (`0x08`) | `0x0800` |
+
+Combinations OR together as a real HID modifier byte (e.g. Ctrl+Shift =
+`0x0300`), confirmed via the vendor software's "Assign a shortcut" dialog
+across all 16 combinations with the same test key. Two-key sequences
+confirmed via Maximize (`type=0x0400, value=0x1b2c` → Alt+Space, then "x")
+and Minimize (`type=0x0400, value=0x112c` → Alt+Space, then "n") — classic
+Windows system-menu mnemonics.
 
 ## Macros
 
@@ -234,12 +323,45 @@ last written (or factory default) — not meaningful until first written.
   array of `(type, value)` tuples), so this is not a limitation for a
   libratbag driver.
 - Uploaded via opcode `0x09` `SET_REPORT` control transfers (8 bytes each),
-  wrapped in the standard begin/commit transaction.
+  wrapped in the standard begin/commit transaction. Assigning a macro to a
+  button (even an *existing*, unchanged one) also re-transmits its full
+  keyboard-event data via opcode `0x0f`, `table_type=0x04`.
 - Each keyboard event = 2 bytes: `[event_byte][HID_keycode]`
   - `event_byte` bit 7 (`0x80`): `0`=press, `1`=release
   - `event_byte` bits 0–6: timing/delay value, unit not calibrated (varies with real typing rhythm)
-- The assigning button's slot in the button-profile packet gets `type=0x0009, value=<macro ID>`.
-- **Not implemented**: the macro-slot-ID assignment mechanism isn't understood (see Open items).
+- The assigning button's slot gets `type = 0x0009 | (repeat_mode<<8), value=<macro ID>` — confirmed via a direct test (existing macro ID `0x0004`) and via 3 isolated repeat-mode tests. **`c18ctl button <slot> macro <id> <mode>` implements the reference side of this** (type/value construction) but **cannot create/upload a macro** — the macro-slot-ID assignment mechanism (how the device picks an ID when a macro is first created) still isn't understood, so this only works for an ID you already know from having created the macro via the vendor software.
+
+## Armoury (burst-fire macro, "N Key") — not implemented
+
+A separate, unrelated sub-protocol from the keyboard-macro system above:
+burst-fire configurator (projectile count, per-projectile strike interval,
+X/Y recoil correction, repeat mode, cycle count), managed as named presets
+("guns"). "N Key" (not "Close the N Key", a different menu item that just
+re-exposes the `type=0x0001` click submenu) opens a popup to assign either an
+Armoury preset or a macro to a button.
+
+- **Button-slot reference**: `type = 0x0c | (repeat_mode<<8)`, same 3-mode
+  enum as macros. `value` presumably a preset index — not cross-checked
+  against more than one active preset, so not implemented.
+- **Fire-parameter packet**: triggered by opcode `0x0f` (`table_type=0x04`)
+  + 64-byte write. Confirmed for a single-projectile preset via an isolated
+  one-field-at-a-time test:
+  ```
+  byte[0-3]: 00 01 02 f0     <- header (byte1 may be projectile count = 1)
+  byte[4]:   0x81 (no X/Y correction) or 0x82 (X/Y correction active)
+  byte[5]:   f0 (constant)
+  [if active] X offset:  LE 16-bit, unsigned (50 -> 0x0032)
+  [if active] Y correction: LE 16-bit, SIGNED, sign-inverted from the UI
+              value (entering 77 -> stored as -77, 0xffb3)
+  strike interval: LE 16-bit = 0x0200 + (interval_ms / 20)
+                   confirmed: 500ms -> 0x0219, 900ms -> 0x022d
+  ```
+  Variable-length, presence-based layout (fields only present when active),
+  not fixed offsets like the DPI/button tables. Multi-projectile presets
+  showed a repeating per-projectile chunk structurally, but weren't
+  cross-verified byte-for-byte against this single-projectile formula.
+  **Not implemented** — out of scope without the preset-index question
+  resolved and multi-projectile support confirmed.
 
 ## Restore Defaults (raw capture, for reference)
 
@@ -276,21 +398,12 @@ byte[32-47]: 00 00 1a 00 00 00 16 00 00 00 04 00 00 00 07 00
 byte[48-63]: 00 00 00 00 00 00 00 00 04 00 01 00 04 00 02 00
 ```
 
-| Bytes | Field | Value |
-|---|---|---|
-| 0-7 | Button 2 | `01 00 f0 00 01 00 f1 00` → marker=1, tag=0x00f0, type=0x0001, value=0x00f1 (241) |
-| 8-11 | Button 3 | `01 00 f2 00` → type=0x0001, value=0x00f2 (242) |
-| 12-15 | Button 4 | `01 00 f4 00` → type=0x0001, value=0x00f4 (244) |
-| 16-19 | Button 5 | `01 00 f3 00` → type=0x0001, value=0x00f3 (243) |
-| 20-23 | Button 6 | `07 00 03 00` → type=0x0007 (DPI function), value=0x0003 (DPI Cycle) |
-| 24-31 | (fixed trailer) | `00 00 2c 00 00 00 00 00` |
-| 32-35 | Button 7 | `00 00 1a 00` → type=0x0000 (keyboard), value=0x001a ("w") |
-| 36-39 | Button 8 | `00 00 16 00` → type=0x0000 (keyboard), value=0x0016 ("s") |
-| 40-63 | (fixed trailer) | `00 00 04 00 00 00 07 00 00 00 00 00 00 00 00 00 04 00 01 00 04 00 02 00` — confirmed identical across both profiles' factory defaults |
-
-Buttons 2-5 all default to the not-yet-fully-decoded `type=0x0001` native-click
-category (values 241-244). Buttons 7/8 defaulting to "w"/"s" (adjacent WASD
-keys) is a nice sanity confirmation.
+See "Button remapping" above for the authoritative, corrected byte-offset
+table (all 11 buttons). Applied to this dump: buttons 1-5 default to
+`type=0x0001` native-click values (Left/Menu/Wheel/Forward/Back), button 6 =
+DPI Cycle, button 11 (offset 24-27) = Space, buttons 7-10 = "w"/"s"/"a"/"d" —
+a complete match to the vendor software's own default-layout diagram, all
+11/11 confirmed live.
 
 ### Default DPI table — raw comparison (profile 2 vs profile 1, both script-verified as exactly 64 bytes)
 
@@ -331,34 +444,41 @@ driver for this setting.
 
 ## Open items / not yet fully mapped
 
-Resolved this round: the earlier byte-count issues in the default-table
-captures (61/58 bytes instead of 64, and the button table's missing bytes
-40-63) were transcription gaps in the first capture pass, not real protocol
-gaps — the corrected, script-verified 64-byte dumps above unblocked
-`c18ctl button` (fully implemented) and `c18ctl dpi-set` (stage 2 only).
-Remaining open items:
+Resolved across this round of captures: the earlier byte-count issues in the
+default-table captures (61/58 bytes instead of 64, and the button table's
+missing bytes 40-63) were transcription gaps, not real protocol gaps;
+Button 1's "marker+tag" was a misreading, not a real quirk (it's just Button
+1's own type/value pair, unchanged in earlier captures); and buttons 9-11
+were simply never tested before. All 11 buttons, the native-click value
+table, keyboard-shortcut modifier encoding, Combo Key, and Exact Control are
+now implemented in `c18ctl button`. Remaining open items:
 
-- **DPI stages 1, 3, 4, 5**: no template captured for editing these — only
-  stage 2 has a validated multi-value capture (`DPI_STAGE2_TEMPLATE`). Needs
-  the same kind of test done for stage 2 (edit one stage through several DPI
-  values via the real UI, capture each, diff) repeated for the other 4
-  stages, ideally also diffing against a stage-2 edit done *in the same
-  session* to see whether editing one stage changes another stage's bytes
-  elsewhere in the table (which would confirm/refute the "table encodes all
-  5 stages at once" theory below).
+- **⚠️ DPI per-stage offset claim needs raw-byte verification before
+  implementation.** A capture pass claims stages 1/3/4/5's X/Y DPI bytes live
+  at offsets 20/22/23/24 (X) and 28/30/31/32 (Y), packed consecutively next
+  to the known stage-2 offset 21/29. But every raw dump actually shown in
+  this document — both profile defaults and the stage-2 multi-value edit
+  template — has those exact offsets fixed at `22 5c d0 f3` / `27 5c d0 f3`
+  in every single capture, never varying. That pattern looks like the fixed
+  header+suffix of the `<header> <DPI_BYTE> 5c d0 f3 5c 73 00` chunk, not
+  five independent per-stage values, and no raw before/after bytes were
+  included to substantiate the "confirmed by diffing stages 1/3/4/5" claim.
+  **Need**: the actual raw packet bytes (before/after) from editing DPI stage
+  1 (or any of 3/4/5) through at least two different DPI values, the same
+  rigor already applied to stage 2. Until then `c18ctl dpi-set` stays
+  restricted to stage 2. See the "Per-stage offset claim" callout in the DPI
+  section above.
 - Bytes 7–9 and 40–63 of the **DPI table** packet: confirmed *not* fixed
   (differ between profiles' Restore-Defaults tables, and differ from the
-  stage-2-edit template) — likely encode the other 4 stages' data and/or
-  per-stage enable flags, not just the active stage-2 value at offset 21/29.
-  Still not decoded; `c18ctl dpi-set` does not attempt to preserve whatever
-  the device's current values are here (it can't — no readback), so it will
-  reset stages 1/3/4/5 to whatever's baked into the stage-2-edit template
-  rather than leave them untouched. Flagged loudly in `c18ctl`'s usage text
-  and in `PROTOCOL.md`'s DPI table section above.
-- Bytes 40–63 of the **button-remap** packet: confirmed fixed/identical
-  across both profiles' factory defaults, so likely genuinely reserved/unused
-  rather than buttons 9+ — but not proven definitively (no test was done
-  where a UI action was expected to touch this region).
+  stage-2-edit template) — still not decoded, possibly related to the
+  per-stage question above. `c18ctl dpi-set` does not attempt to preserve
+  whatever the device's current values are here (it can't — no readback), so
+  it will reset whatever's encoded there to the stage-2-edit template's
+  values rather than leave them untouched.
+- Bytes 28–31 and 48–63 of the **button-remap** packet: confirmed
+  fixed/identical across both profiles' factory defaults and unchanged
+  through the full 11-button sweep, so likely genuinely reserved — but not
+  proven via a test that specifically targeted this region.
 - `c18ctl button` writes the whole 64-byte table from the factory-default
   template every time (no readback exists to preserve other buttons' current
   state) — so setting one button resets every other button on that profile
@@ -366,9 +486,14 @@ Remaining open items:
   client-side to avoid this.
 - The DPI-table primer packet (`ff ff 00 00 ...`) purpose.
 - Exact analytic formula (if any) for the DPI byte encoding above ~4800 DPI.
-- `type=0x0001` (native mouse-click function) values `0xf0`-`0xf4`: category
-  identified via factory defaults, but exact value→action mapping (Left/
-  Right/Middle/Forward/Back click) not yet confirmed — needs a test explicitly
-  assigning each native click action via the software UI.
-- Macro-slot-ID assignment mechanism (how the device picks the `value` used
-  by `type=0x0009`) — not understood, blocks macro upload implementation.
+- Whether "Sniper Mode" (hold-to-lower-DPI) or a "DPI Reset" function exists
+  distinct from Up/Down/Cycle — not checked.
+- Whether "Disabled" is genuinely just `type=0x0000, value=0x00`, or a
+  distinct explicit disable flag exists elsewhere.
+- Macro-slot-ID assignment mechanism (how the device picks an ID when a
+  macro is first created) — not understood, blocks macro *upload*
+  (referencing an already-known ID is implemented, see Button remapping).
+- **Armoury**: repeat-mode encoding resolved (shares the macro's 3-mode
+  enum), but whether `value` encodes a preset index when multiple presets
+  exist isn't cross-checked, and multi-projectile fire-parameter encoding
+  isn't confirmed byte-for-byte. Not implemented.
