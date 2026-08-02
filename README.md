@@ -21,11 +21,12 @@ configured on Linux via Piper.
   Combo Key (Double-click/Three-click/Fire Button), Exact Control, and macro
   references. Real limitation: no readback exists, so every call rewrites the
   whole table and resets any other previously-set button back to factory
-  default (same limitation applies to `dpi-set` and other stages/profile
-  metadata bytes it can't decode yet).
+  default (same limitation applies to `dpi-set`).
 - **Macro upload: not implemented** — referencing an existing macro by ID
-  works, but the macro-slot-ID assignment mechanism (how the device picks an
-  ID for a *new* macro) isn't understood.
+  works, and the ID *allocation pattern* is now understood (sequential,
+  shared pool with Armoury presets, not driver-controllable), but the actual
+  device-side trigger for creating a *new* macro was never captured, so a
+  driver still can't create one.
 - **Armoury (burst-fire presets): protocol fully decoded, not implemented as
   a CLI command** — the variable-length packet format wasn't worth the added
   surface without a concrete use case; see `PROTOCOL.md`.
@@ -169,9 +170,12 @@ confirmed vs. inferred.
 
 ## Contributing captures
 
-The main remaining gaps are decoding DPI-table bytes 7-9/40-63 (still unknown
-per-profile metadata, doesn't affect current functionality) and macro-upload
-support (needs the slot-ID assignment mechanism figured out — capture the
-exact moment a *new* macro is first created and saved, before it's ever
-referenced by a button, to see how its ID gets picked). See `PROTOCOL.md` →
-"Open items" for the full list.
+The one functional gap left is macro *upload*. Referencing an existing macro
+works, and the ID allocation pattern is understood, but the device-side
+trigger for creating a brand-new macro was never isolated. What's needed: a
+capture of the exact moment a *new* macro is first created and saved in the
+vendor software, before it's ever assigned to a button — that's the step
+that reveals how (or whether) a specific ID gets returned. See `PROTOCOL.md`
+→ "Open items" for the full list (DPI-table bytes 7-9/40-63 and the
+button-remap trailer are also technically undecoded, but both are confirmed
+fixed/inert, so they don't block anything).

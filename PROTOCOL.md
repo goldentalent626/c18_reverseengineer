@@ -171,17 +171,25 @@ with the calibration table's own pre-existing "not exact"/"not fully
 characterized" caveats for those DPI ranges (see below) — not a sign the
 offset table is wrong.
 
-**Bytes 7–9 and 40–63 are still not fixed/not decoded** — they differ
-between Profile 1 and Profile 2's default tables (see Restore Defaults
-below). Per the device having no readback, `c18ctl dpi-set` seeds every
-write from the *target profile's* factory-default table
+**Bytes 7–9 and 40–63: exact semantic meaning still unknown, but
+operationally resolved.** They differ between Profile 1 and Profile 2's
+default tables (see Restore Defaults below), so they're not a hardcoded
+constant across the whole device — but within a given profile, they've been
+shown **deterministic and unaffected by every testable UI control**:
+confirmed unchanged across a stage1→1200→800→1200 DPI sequence (the two
+1200-DPI writes came back byte-for-byte identical, ruling out a
+counter/timestamp/nonce), and ruled out as encoding the "Configuration
+sensitivity level" checkboxes, the profile name/description text, or
+per-stage data (the real per-stage offsets are 20-24/28-32, confirmed
+separately above and don't overlap this region). No UI action found across
+either profile ever touches these bytes. Conclusion: **a fixed, per-profile
+constant** — safe to cache from the factory-default table and always resend
+unchanged, which is exactly what `c18ctl dpi-set` already does: it seeds
+every write from the *target profile's* factory-default table
 (`PROFILE1_DPI_DEFAULT`/`PROFILE2_DPI_DEFAULT` in `c18ctl.c`) and patches
-only the 2 target-stage bytes, leaving bytes 7-9/40-63 and every other
-stage's bytes exactly as they are in that default table. This means running
-`dpi-set` does **not** preserve whatever the device's *actual current*
-values are for other stages if they've been changed from factory default by
-some other means (impossible to know without readback) — it resets them
-back to the factory-default table's values. See Open items.
+only the 2 target-stage bytes, leaving bytes 7-9/40-63 exactly as they are
+in that default table. No code change needed here — this capture confirms
+the existing implementation's approach was already correct.
 
 ### DPI calibration table (stage 2, confirmed range 200–10000)
 
@@ -324,7 +332,31 @@ Windows system-menu mnemonics.
 - Each keyboard event = 2 bytes: `[event_byte][HID_keycode]`
   - `event_byte` bit 7 (`0x80`): `0`=press, `1`=release
   - `event_byte` bits 0–6: timing/delay value, unit not calibrated (varies with real typing rhythm)
-- The assigning button's slot gets `type = 0x0009 | (repeat_mode<<8), value=<macro ID>` — confirmed via a direct test (existing macro ID `0x0004`) and via 3 isolated repeat-mode tests. **`c18ctl button <slot> macro <id> <mode>` implements the reference side of this** (type/value construction) but **cannot create/upload a macro** — the macro-slot-ID assignment mechanism (how the device picks an ID when a macro is first created) still isn't understood, so this only works for an ID you already know from having created the macro via the vendor software.
+- The assigning button's slot gets `type = 0x0009 | (repeat_mode<<8), value=<macro ID>` — confirmed via a direct test (existing macro ID `0x0004`) and via 3 isolated repeat-mode tests. **`c18ctl button <slot> macro <id> <mode>` implements the reference side of this** (type/value construction) but **cannot create/upload a macro** — see "Macro ID assignment" below.
+
+### Macro ID assignment
+
+**IDs are device/software-managed, sequential, and not predictable or
+user-controlled** — a driver can't choose a macro's ID itself. Confirmed by
+creating two distinct new macros ("anothermacro" then "anothermacro2") and
+assigning each to a different button: they got IDs `0x0004` and `0x0007`
+respectively — not consecutive. The gap (`0x0005`, `0x0006`) is very likely
+Armoury presets created earlier in the same session ("test", "Armoury1",
+"Armoury2"), since Armoury references use the identical
+`base_type | (mode<<8)` pattern (`0x0c` base vs. macro's `0x0009` base) —
+strongly suggesting **macros and Armoury presets share one common,
+sequentially-allocated ID pool**, not two separate counters.
+
+**Still blocks macro upload**: the *allocation pattern* is now understood
+(sequential, shared pool, not driver-controllable), but the actual
+device-side trigger for "create a brand new macro and get back its ID"
+wasn't isolated/captured — the ID just showed up already assigned by the
+time a button-slot reference was captured. `c18ctl button <slot> macro <id>
+<mode>` still only works for an ID you already know from having created the
+macro via the vendor software; a driver wanting to create macros would need
+either a dedicated capture of the creation step itself, or to maintain its
+own counter mirroring the device's allocation order (risky — collides with
+anything created via the vendor software).
 
 ## Armoury (burst-fire macro, "N Key") — protocol fully understood, not implemented in `c18ctl`
 
@@ -473,34 +505,38 @@ buttons, the native-click value table, keyboard-shortcut modifier encoding,
 Combo Key, Exact Control, and all 5 DPI stages are now implemented in
 `c18ctl`. Remaining open items:
 
-- Bytes 7–9 and 40–63 of the **DPI table** packet: confirmed *not* fixed
-  (differ between profiles' Restore-Defaults tables) — still not decoded.
-  Since the per-stage offsets (20-24/28-32) are now confirmed and don't
-  overlap this region, these bytes are something else entirely — two
-  hypotheses ruled out: not the "Configuration sensitivity level" checkboxes
-  (confirmed single-select, functionally identical to the already-mapped
-  active-stage selector) and not the profile name/description text
-  (confirmed entirely host-side). `c18ctl dpi-set` preserves these bytes
-  as-is from the target profile's default table on every write (it can't
-  do anything smarter without readback).
+**Closed out this round**: bytes 7-9/40-63 of the DPI table packet (exact
+semantic meaning still unknown, but confirmed deterministic/unaffected by
+every testable UI control across dozens of captures — a fixed per-profile
+constant, safe to cache-and-resend, exactly what `c18ctl dpi-set` already
+does — see the DPI section above); the DPI-table primer packet's *content*
+(fixed/identical in every capture — a driver just always sends this exact
+packet, even though *why* the firmware needs it isn't knowable without
+source access); and the macro/Armoury ID *allocation pattern* (sequential,
+shared pool between macros and Armoury presets, not driver-controllable).
+
+Genuinely still open:
+
+- **Macro upload still blocked**: the ID allocation *pattern* is understood
+  (see "Macro ID assignment" above), but the device-side trigger for
+  "create a brand new macro" itself was never isolated/captured — the ID
+  just showed up already assigned. Referencing an already-known ID is
+  implemented (`c18ctl button <slot> macro`); creating one isn't.
 - Bytes 28–31 and 48–63 of the **button-remap** packet: confirmed
   fixed/identical across both profiles' factory defaults and unchanged
   through the full 11-button sweep, so likely genuinely reserved — but not
   proven via a test that specifically targeted this region.
-- `c18ctl button` writes the whole 64-byte table from the factory-default
-  template every time (no readback exists to preserve other buttons' current
-  state) — so setting one button resets every other button on that profile
-  back to factory default. A real driver needs to track full table state
-  client-side to avoid this.
-- The DPI-table primer packet (`ff ff 00 00 ...`) purpose.
-- Exact analytic formula (if any) for the DPI byte encoding above ~4800 DPI.
+- `c18ctl button` and `c18ctl dpi-set` both write their whole table from a
+  factory-default template every time (no readback exists to preserve
+  current state) — setting one button/stage resets every other
+  button/stage on that profile back to factory default. A real driver needs
+  to track full table state client-side to avoid this.
+- Exact analytic formula (if any) for the DPI byte encoding above ~4800 DPI
+  (cosmetic only — the lookup table with interpolation already covers it).
 - Whether "Sniper Mode" (hold-to-lower-DPI) or a "DPI Reset" function exists
   distinct from Up/Down/Cycle — not checked.
 - Whether "Disabled" is genuinely just `type=0x0000, value=0x00`, or a
   distinct explicit disable flag exists elsewhere.
-- Macro-slot-ID assignment mechanism (how the device picks an ID when a
-  macro is first created) — not understood, blocks macro *upload*
-  (referencing an already-known ID is implemented, see Button remapping).
 - **Armoury**: protocol fully decoded (repeat-mode encoding, confirmed no
   persistent preset index, single- and multi-projectile fire-parameter
   encoding with distinct interval formulas) — see the Armoury section. Not
