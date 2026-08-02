@@ -353,31 +353,57 @@ pair (not present before the very first key). Confirmed via two live tests:
 [00 03] [00 <value>]   <- fixed marker (00 03), then a value byte
 ```
 
-- The `[00 03]` marker is constant. At a glance it resembles `type=0x0003`
-  (Consumer/media, in the button-table context), but note the byte order is
-  actually reversed from that: this doc's button-table fields are
-  little-endian (`type=0x0003` serializes as `03 00`, confirmed by the
-  default button table's own `07 00 03 00` for button 6), so `00 03` here
-  is not literally the same wire pattern — just a coincidental resemblance
-  in an unrelated packet. Don't conflate the two.
-- The value byte **maxes out at `0x7f` (127)** — confirmed by clamping: a
-  precisely-timed 9-second wait produced exactly `0x7f`, the maximum value a
-  7-bit-range byte can hold (same clamping behavior seen with the Combo-Key
-  Delay field elsewhere in this doc).
-- An earlier, less precise test (waits *counted out* rather than timed —
-  "2, 3, 4, 5 seconds") produced values `26, 32, 44, 48` for those
-  nominal durations — increasing with wait length, but not cleanly linear
-  against the stated seconds. Given the 9-second test's precise, clamped
-  result, this is most likely explained by counting imprecision (a person
-  counting seconds aloud is commonly ±10-20% off real time) rather than a
-  non-linear encoding.
+- The `[00 03]` marker is constant. **Correction**: an earlier version of
+  this note claimed it "coincidentally matches the byte pattern of
+  `type=0x0003`" — that was wrong. Per this doc's own stated convention
+  (multi-byte fields are little-endian), `type=0x0003` is encoded on the
+  wire as `03 00` (confirmed by e.g. button 6's `07 00 03 00` in the
+  Restore Defaults dump — type `07 00`, value `03 00`). The wait-block
+  marker `00 03` is the **reverse** byte order — same two hex digits, not
+  the same field or a real collision. Unrelated, and not actually similar
+  once byte order is accounted for.
+- **Raw evidence (independently re-verifiable)**: an earlier version of this
+  section presented the derived values below with no raw bytes to check
+  them against; both source payloads are reproduced here in full instead.
+
+  Source `macro_delay_calibration.pcapng` frame 12961 (counted-out
+  "2, 3, 4, 5 second" waits before the 2nd/3rd/4th/5th keystrokes — digits
+  '2'/'3'/'4'/'5' respectively), full 64-byte payload:
+  ```
+  0001371e861e0003001a271f8d1f000300202f208a200003002c2f21932100030030372281220000000000000000000000000000000000000000000000000000
+  ```
+  Source `macro_delay_calibration2.pcapng` frame 8101 (one precisely
+  stopwatch-timed 9-second wait before the 2nd keystroke — digit '9',
+  chosen as a mnemonic for the 9-second test, not literal key "2"), full
+  64-byte payload:
+  ```
+  00011f1e801e0003007f272681260000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+  ```
+  Decoded: payload 1 is `press/release '1'` (no wait before the first key,
+  confirming that claim), then `WAIT(0x1a=26) → press/release '2'`,
+  `WAIT(0x20=32) → '3'`, `WAIT(0x2c=44) → '4'`, `WAIT(0x30=48) → '5'`.
+  Payload 2 is `press/release '1'`, then `WAIT(0x7f=127) → press/release
+  '9'`.
+- The value byte **maxes out at `0x7f` (127)** — confirmed by clamping: the
+  precisely-timed 9-second wait (payload 2 above) produced exactly `0x7f`,
+  the maximum value a 7-bit-range byte can hold (same clamping behavior
+  seen with the Combo-Key Delay field elsewhere in this doc).
+- The counted-out test (payload 1 above) produced values `26, 32, 44, 48`
+  for nominal "2, 3, 4, 5 second" waits — increasing with wait length, but
+  not cleanly linear against the stated seconds. Given the 9-second test's
+  precise, clamped result, this is most likely explained by counting
+  imprecision (a person counting seconds aloud is commonly ±10-20% off real
+  time) rather than a non-linear encoding — but this reasoning, unlike the
+  clamp finding itself, can't be independently re-verified from the bytes
+  alone; it rests on trusting the stated real-world timing of each test.
 - **Exact ms-per-unit scale not established** — getting a clean unclamped
   calibration point requires stopwatch-precise timing during a live
   recording, which proved too fiddly to execute reliably by hand and wasn't
-  pursued further. What's solid: the mechanism's existence, its 4-byte
-  structure, the fixed `00 03` marker, and the `0x7f` ceiling. Unlike most
-  of this document, this section has no raw packet hex to independently
-  re-verify — treat it as lower-confidence than the rest.
+  pursued further. What's solid and independently verifiable from the raw
+  bytes above: the mechanism's existence, its 4-byte structure, the fixed
+  `00 03` marker, and the `0x7f` ceiling. What rests on weaker evidence: the
+  claim that the low-precision test's non-linearity is explained by timing
+  error rather than something else.
 - **Driver implication**: a driver can safely support *short* macros with no
   inter-key pauses (the common case) using zero for the per-event delay
   bits, exactly as already implemented. Supporting deliberate multi-second
