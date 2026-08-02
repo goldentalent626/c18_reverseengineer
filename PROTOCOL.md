@@ -336,7 +336,56 @@ Windows system-menu mnemonics.
   libratbag driver.
 - Each keyboard event = 2 bytes: `[event_byte][HID_keycode]`
   - `event_byte` bit 7 (`0x80`): `0`=press, `1`=release
-  - `event_byte` bits 0–6: timing/delay value, unit not calibrated (varies with real typing rhythm)
+  - `event_byte` bits 0–6: **short** timing value — appears to represent how
+    long the key was physically held (naturally brief, tens of ms), not
+    inter-key pause time. Unit not calibrated, but a driver defaulting this
+    to zero (immediate press/release) is a safe, harmless choice — it's a
+    separate field from the actual inter-key delay mechanism below, and
+    exactly what `c18ctl macro-create` already does.
+
+### Inter-key wait blocks (long pauses)
+
+A real, multi-second pause between keystrokes during recording is encoded
+as a distinct **4-byte block** inserted before the next key's press/release
+pair (not present before the very first key). Confirmed via two live tests:
+
+```
+[00 03] [00 <value>]   <- fixed marker (00 03), then a value byte
+```
+
+- The `[00 03]` marker is constant. At a glance it resembles `type=0x0003`
+  (Consumer/media, in the button-table context), but note the byte order is
+  actually reversed from that: this doc's button-table fields are
+  little-endian (`type=0x0003` serializes as `03 00`, confirmed by the
+  default button table's own `07 00 03 00` for button 6), so `00 03` here
+  is not literally the same wire pattern — just a coincidental resemblance
+  in an unrelated packet. Don't conflate the two.
+- The value byte **maxes out at `0x7f` (127)** — confirmed by clamping: a
+  precisely-timed 9-second wait produced exactly `0x7f`, the maximum value a
+  7-bit-range byte can hold (same clamping behavior seen with the Combo-Key
+  Delay field elsewhere in this doc).
+- An earlier, less precise test (waits *counted out* rather than timed —
+  "2, 3, 4, 5 seconds") produced values `26, 32, 44, 48` for those
+  nominal durations — increasing with wait length, but not cleanly linear
+  against the stated seconds. Given the 9-second test's precise, clamped
+  result, this is most likely explained by counting imprecision (a person
+  counting seconds aloud is commonly ±10-20% off real time) rather than a
+  non-linear encoding.
+- **Exact ms-per-unit scale not established** — getting a clean unclamped
+  calibration point requires stopwatch-precise timing during a live
+  recording, which proved too fiddly to execute reliably by hand and wasn't
+  pursued further. What's solid: the mechanism's existence, its 4-byte
+  structure, the fixed `00 03` marker, and the `0x7f` ceiling. Unlike most
+  of this document, this section has no raw packet hex to independently
+  re-verify — treat it as lower-confidence than the rest.
+- **Driver implication**: a driver can safely support *short* macros with no
+  inter-key pauses (the common case) using zero for the per-event delay
+  bits, exactly as already implemented. Supporting deliberate multi-second
+  pauses would need this wait-block structure, but without a precise scale,
+  a driver should either avoid emitting them, or treat any requested pause
+  as approximate/best-effort until this is recalibrated. **Not implemented
+  in `c18ctl macro-create`** — see Open items.
+
 - The assigning button's slot gets `type = 0x0009 | (repeat_mode<<8), value=<macro ID>` — confirmed via a direct test (existing macro ID `0x0004`) and via 3 isolated repeat-mode tests. **`c18ctl button <slot> macro <id> <mode>` implements this reference side** (type/value construction, for an ID you already know).
 - **Content-upload mechanism — resolved** (previously the one open protocol
   gap in this doc): macro content is uploaded via opcode `0x0f <target_ID>
@@ -673,7 +722,13 @@ Genuinely still open:
 **Not yet implemented in `c18ctl` (protocol is understood — this is pure CLI
 work, not blocked on RE)**:
 - Armoury preset upload (fire-parameter packet via `0x0f`) — see above.
-- `c18ctl macro-create` always targets profile 1 and always emits
-  `event_byte` with the delay bits zeroed (the real delay unit/meaning is
-  still uncalibrated) — a driver wanting profile-2 macros or specific
-  inter-key timing would need to extend both.
+- `c18ctl macro-create` always targets profile 1 — a driver wanting
+  profile-2 macros would need to expose that.
+
+**Not yet implemented, and still blocked on RE**:
+- Inter-key wait blocks (deliberate multi-second pauses in a macro) — the
+  4-byte `[00 03][00 <value>]` block structure and its `0x7f` ceiling are
+  confirmed (see the Macros section), but the exact ms-per-unit scale isn't
+  calibrated, so `c18ctl macro-create` can't emit an accurate one yet.
+  Getting a clean calibration point needs stopwatch-precise timing during a
+  live recording.
