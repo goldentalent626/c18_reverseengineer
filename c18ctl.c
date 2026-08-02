@@ -178,6 +178,7 @@ static void build_cmd(unsigned char out[8], unsigned char opcode, unsigned char 
 #define OP_SET_DPI_STAGE        0x04 // build_cmd(_, 0x04, profile, stage)
 #define OP_PREPARE_DPI_TABLE    0x0c // build_cmd(_, 0x0c, profile, 0x80)
 #define OP_PREPARE_BUTTON_TABLE 0x0d // build_cmd(_, 0x0d, profile, 0x80)
+#define OP_PREPARE_EXT_DATA     0x0f // build_cmd(_, 0x0f, target_id, 0x80) — macro/Armoury content upload trigger
 
 static int set_feature(libusb_device_handle *h, int iface, const unsigned char feat[8]) {
   return libusb_control_transfer(
@@ -431,6 +432,63 @@ static unsigned char parse_macro_mode(const char *s) {
   return 0;
 }
 
+// Only 1-2 packet macros (up to 48 events) have been verified against real
+// hardware (see PROTOCOL.md's "Multi-packet macros" section). This cap is
+// generous well beyond that to leave room, not a confirmed device limit.
+#define MAX_MACRO_KEYS 96
+
+// Builds a macro's full keyboard-event byte stream: `00 01` header followed
+// by press-then-release `[event_byte][keycode]` pairs for each key (see
+// PROTOCOL.md's Macros section). event_byte's low 7 bits are an uncalibrated
+// timing/delay value that real captures show varying with actual typing
+// rhythm — meaning/unit unknown, so we always emit 0 here.
+static int build_macro_events(unsigned char *buf, int buf_cap, const unsigned short *keys, int n_keys) {
+  int len = 2 + n_keys * 4;
+  if (len > buf_cap) die("macro too long");
+  memset(buf, 0, buf_cap);
+  buf[0] = 0x00;
+  buf[1] = 0x01;
+  int off = 2;
+  for (int i = 0; i < n_keys; i++) {
+    buf[off++] = 0x00;                        // press, no delay
+    buf[off++] = (unsigned char)keys[i];
+    buf[off++] = 0x80;                        // release, no delay
+    buf[off++] = (unsigned char)keys[i];
+  }
+  return len;
+}
+
+// Uploads macro content as one or more 64-byte writes on endpoint 0x04,
+// zero-padding the final packet, followed by a single all-zero 64-byte ack
+// packet — replicates PROTOCOL.md's worked example exactly. Only the first
+// packet carries the `00 01` header; later packets are a raw continuation
+// of the event stream with no header of their own (confirmed in the
+// "Multi-packet macros" section).
+static void send_macro_content(libusb_device_handle *h, unsigned char ep_out, const unsigned char *buf, int len) {
+  int num_packets = (len + 63) / 64;
+  if (num_packets > 2) {
+    fprintf(stderr,
+      "warning: this macro needs %d packets; only 1-2 packet macros have "
+      "been verified against real hardware (see PROTOCOL.md open items)\n",
+      num_packets);
+  }
+  for (int i = 0; i < num_packets; i++) {
+    unsigned char pkt[64] = {0};
+    int chunk = len - i * 64;
+    if (chunk > 64) chunk = 64;
+    if (chunk > 0) memcpy(pkt, buf + i * 64, chunk);
+    int xfer = 0;
+    int rc = out64(h, ep_out, pkt, &xfer);
+    if (rc || xfer != 64) fprintf(stderr, "macro content packet %d/%d failed: rc=%d xfer=%d\n", i + 1, num_packets, rc, xfer);
+    usleep(20000);
+  }
+  unsigned char zero[64] = {0};
+  int xfer = 0;
+  int rc = out64(h, ep_out, zero, &xfer);
+  if (rc || xfer != 64) fprintf(stderr, "macro content ack failed: rc=%d xfer=%d\n", rc, xfer);
+  usleep(40000);
+}
+
 static void usage(void) {
   fprintf(stderr,
     "Usage:\n"
@@ -455,6 +513,7 @@ static void usage(void) {
     "  sudo ./c18ctl button <slot 1-11> combo <times> <delay_ms> [profile]\n"
     "  sudo ./c18ctl button <slot 1-11> exact-control [profile]\n"
     "  sudo ./c18ctl button <slot 1-11> macro <0xHH id> <once|until-interrupted|until-released> [profile]\n"
+    "  sudo ./c18ctl macro-create <slot 1-11> <0xHH id> <once|until-interrupted|until-released> <key1> [key2 ...]\n"
     "\n"
     "Colors: red green blue yellow purple cyan white off\n"
     "mods: any combination of c/s/a/w (Ctrl/Shift/Alt/Win), or -/none.\n"
@@ -462,7 +521,12 @@ static void usage(void) {
     "combo is Double-click/Three-click/Fire-button's shared mechanism; delay_ms\n"
     "is clamped to 127 (device's confirmed max, a signed byte).\n"
     "macro only *references* an existing macro ID created via the vendor\n"
-    "software — this tool cannot upload/create macros (see PROTOCOL.md).\n"
+    "software; macro-create uploads new keyboard-only macro content (each key\n"
+    "listed is pressed then released, in order) AND assigns it to <slot>, in\n"
+    "one transaction, choose any <0xHH id> not already used by another button/\n"
+    "Armoury preset on this profile (the device does no allocation itself, see\n"
+    "PROTOCOL.md). Keys use the same a-z/0-9/0xHH syntax as `button key`.\n"
+    "macro-create always targets profile 1 (not yet exposed as an option).\n"
     "\n"
     "dpi-set writes the whole DPI table, seeded from the profile's factory\n"
     "default (bytes 7-9/40-63, still undecoded, are preserved as-is from\n"
@@ -473,7 +537,7 @@ static void usage(void) {
   );
 }
 
-enum cmd_kind { KIND_LED, KIND_PROFILE, KIND_POLLING, KIND_DPI_STAGE, KIND_DPI_TABLE, KIND_BUTTON };
+enum cmd_kind { KIND_LED, KIND_PROFILE, KIND_POLLING, KIND_DPI_STAGE, KIND_DPI_TABLE, KIND_BUTTON, KIND_MACRO_CREATE };
 
 int main(int argc, char **argv) {
   if (argc < 2) { usage(); return 2; }
@@ -482,6 +546,9 @@ int main(int argc, char **argv) {
   enum cmd_kind kind;
   unsigned char profile = 1;
   unsigned char arg_byte = 0; // polling interval or dpi stage, depending on kind
+  unsigned char macro_id = 0;
+  unsigned short macro_keys[MAX_MACRO_KEYS];
+  int n_macro_keys = 0;
 
   const char *cmd = argv[1];
 
@@ -608,6 +675,24 @@ int main(int argc, char **argv) {
     profile = parse_profile(profile_arg);
     memcpy(payload, BUTTON_DEFAULT_TABLE, 64);
     set_button_type_value(payload, slot, btype, bvalue);
+  } else if (streq(cmd, "macro-create")) {
+    if (argc < 6) { usage(); return 2; }
+    kind = KIND_MACRO_CREATE;
+    int slot = atoi(argv[2]);
+    macro_id = (unsigned char)strtol(argv[3], NULL, 16);
+    unsigned char mode = parse_macro_mode(argv[4]);
+
+    for (int i = 5; i < argc; i++) {
+      if (n_macro_keys >= MAX_MACRO_KEYS) die("macro too long (see MAX_MACRO_KEYS / PROTOCOL.md open items)");
+      macro_keys[n_macro_keys++] = parse_key(argv[i]);
+    }
+    if (n_macro_keys == 0) die("macro-create needs at least one key");
+
+    profile = 1; // macro-create always targets profile 1 (see usage)
+    unsigned short btype = (unsigned short)(0x0009 | (mode << 8));
+    unsigned short bvalue = macro_id;
+    memcpy(payload, BUTTON_DEFAULT_TABLE, 64);
+    set_button_type_value(payload, slot, btype, bvalue);
   } else {
     usage();
     return 2;
@@ -671,6 +756,32 @@ int main(int argc, char **argv) {
     send_cmd(h, OP_SET_POLLING, profile, arg_byte, "set polling rate");
   } else if (kind == KIND_DPI_STAGE) {
     send_cmd(h, OP_SET_DPI_STAGE, profile, arg_byte, "set dpi stage");
+  } else if (kind == KIND_MACRO_CREATE) {
+    // Replicates PROTOCOL.md's macro worked example step-for-step: button-
+    // slot reference write + its own all-zero ack, then the 0x0f-triggered
+    // content upload (one or more packets) + its own ack, then the shared
+    // OP_SELECT_COMMIT below closes the transaction. Unlike the plain
+    // KIND_BUTTON path above, this explicit all-zero ack packet after the
+    // button-table write is required to match the captured sequence exactly
+    // — see PROTOCOL.md.
+    send_cmd(h, OP_PREPARE_BUTTON_TABLE, profile, 0x80, "prepare button table");
+
+    rc = out64(h, ep_out, payload, &xfer);
+    if (rc || xfer != 64) fprintf(stderr, "button payload out failed: rc=%d xfer=%d\n", rc, xfer);
+    usleep(20000);
+
+    {
+      unsigned char zero[64] = {0};
+      rc = out64(h, ep_out, zero, &xfer);
+      if (rc || xfer != 64) fprintf(stderr, "button ack failed: rc=%d xfer=%d\n", rc, xfer);
+      usleep(20000);
+    }
+
+    unsigned char macro_buf[2 + MAX_MACRO_KEYS * 4];
+    int macro_len = build_macro_events(macro_buf, sizeof(macro_buf), macro_keys, n_macro_keys);
+
+    send_cmd(h, OP_PREPARE_EXT_DATA, macro_id, 0x80, "prepare macro content upload");
+    send_macro_content(h, ep_out, macro_buf, macro_len);
   }
   // KIND_PROFILE has no extra command — OP_SELECT_COMMIT below both selects
   // the profile and commits, per PROTOCOL.md's transaction model.

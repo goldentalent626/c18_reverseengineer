@@ -56,7 +56,7 @@ commands (see "LED / RGB" below) — same formula, same transaction wrapper.
 | `0x04` | Set active DPI stage | `04 <profile#> <stage 1-5> 00 00 00 00 <checksum>` | Implemented (`c18ctl dpi-stage`) |
 | `0x0c` | Prepare to write DPI table | `0c <profile#> 80 00 00 00 00 <checksum>` — precedes the DPI-table primer+data writes on endpoint `0x04` | Implemented — this is the same "prepare table" step the LED command sequence already used (previously named `FEAT_ARM`). The 64-byte DPI table write itself is implemented for all 5 stages (`c18ctl dpi-set <stage> <dpi>`). |
 | `0x0d` | Prepare to write button table | `0d <profile#> 80 00 00 00 00 <checksum>` — precedes the button-table write on endpoint `0x04` | Implemented (`c18ctl button`) |
-| `0x0f` | Prepare to upload extended per-reference data | `0f <target_ID> 80 00 00 00 00 <checksum>` — second byte is the **macro or Armoury preset ID** being uploaded to (not a profile number, and not a generic "table type" as an earlier version of this doc claimed), followed by that ID's full content on endpoint `0x04`. Confirmed three-for-three across independent macro-ID tests — see Macros below for the full worked example, including a multi-packet (>1 write) case. | Reference-only write (`c18ctl button <slot> macro <id>`) is implemented; sending *new* macro/Armoury content via this opcode is not — see Open items |
+| `0x0f` | Prepare to upload extended per-reference data | `0f <target_ID> 80 00 00 00 00 <checksum>` — second byte is the **macro or Armoury preset ID** being uploaded to (not a profile number, and not a generic "table type" as an earlier version of this doc claimed), followed by that ID's full content on endpoint `0x04`. Confirmed three-for-three across independent macro-ID tests — see Macros below for the full worked example, including a multi-packet (>1 write) case. | Reference-only write (`c18ctl button <slot> macro <id>`) and macro content upload (`c18ctl macro-create`) are both implemented; Armoury fire-parameter upload via this opcode is not — see Open items |
 
 **Note on `SET_REPORT (0x09)`**: every command in this table is sent as a USB
 HID `SET_REPORT` class request — `bRequest=0x09` in the USB control transfer
@@ -345,8 +345,15 @@ Windows system-menu mnemonics.
   exactly. This is the *same* mechanism used for Armoury fire-parameter
   uploads (see Armoury below); `0x0f` is a general "upload extended data for
   reference ID=X" signal, not macro-specific. See the full worked example
-  below. **Not yet implemented in `c18ctl`** — see Open items for why this
-  is now a pure implementation task rather than a protocol unknown.
+  below. **Implemented** — `c18ctl macro-create <slot> <0xHH id> <mode>
+  <key1> [key2 ...]` sends the button-slot write, its ack, the `0x0f`
+  trigger, and the multi-packet content upload in one transaction, choosing
+  the ID as described in "Macro ID assignment" below. It always emits
+  `event_byte` with the delay bits zeroed (see the event-byte note above —
+  the real unit/meaning is uncalibrated, so 0 is as valid as any other
+  value) and always targets profile 1 (not yet exposed as a CLI option).
+  Verified only up to 2 content packets (48 events) — see Open items for
+  the 3+ packet caveat.
 
 ### Complete worked example (raw bytes, full transaction)
 
@@ -457,15 +464,15 @@ the same session, since Armoury references use the identical
 `base_type | (mode<<8)` pattern) reflect the **vendor software's own
 internal counter**, not anything the device tracks or validates.
 
-**Combined with the now-resolved content-upload mechanism above**, a driver
-has everything it needs: pick any ID not already in use by that profile's
+**Combined with the resolved content-upload mechanism above**, a driver has
+everything it needs: pick any ID not already in use by that profile's
 buttons/Armoury presets (tracked in the driver's own state), then send the
 button-slot reference write followed by the `0x0f`-triggered content
 upload, exactly as shown in the worked example above. `c18ctl button <slot>
-macro` currently only *references* an existing ID (useful for an
-already-known macro from the vendor software) — implementing content
-creation/upload is now a pure CLI implementation task, not blocked on any
-remaining protocol unknown (see Open items).
+macro` only *references* an existing ID (useful for an already-known macro
+from the vendor software); `c18ctl macro-create` does the full
+create-and-assign flow, generating its own event data and choosing the ID
+you pass it — see the Macros section above.
 
 ## Armoury (burst-fire macro, "N Key") — protocol fully understood, not implemented in `c18ctl`
 
@@ -638,6 +645,9 @@ Genuinely still open:
   same "keep writing consecutive packets, zero-pad the last one" pattern —
   only tested up to 2 packets (48 events). Low risk given the mechanism
   generalized cleanly from 1→2 packets, but not proven beyond that.
+  `c18ctl macro-create` allows longer macros anyway but prints a warning
+  when a macro would need 3+ packets, since that combination hasn't been
+  run against real hardware.
 - Bytes 28–31 and 48–63 of the **button-remap** packet: confirmed
   fixed/identical across both profiles' factory defaults and unchanged
   through the full 11-button sweep, so likely genuinely reserved — but not
@@ -662,8 +672,8 @@ Genuinely still open:
 
 **Not yet implemented in `c18ctl` (protocol is understood — this is pure CLI
 work, not blocked on RE)**:
-- Macro content creation/upload: the `0x0f` + keyboard-event-packet(s)
-  mechanism, including the multi-packet case. Reference-only assignment
-  (`c18ctl button <slot> macro <id>`) exists; there's no `c18ctl macro
-  create`/`upload` equivalent yet.
 - Armoury preset upload (fire-parameter packet via `0x0f`) — see above.
+- `c18ctl macro-create` always targets profile 1 and always emits
+  `event_byte` with the delay bits zeroed (the real delay unit/meaning is
+  still uncalibrated) — a driver wanting profile-2 macros or specific
+  inter-key timing would need to extend both.
