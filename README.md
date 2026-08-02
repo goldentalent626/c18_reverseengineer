@@ -22,17 +22,25 @@ configured on Linux via Piper.
   references. Real limitation: no readback exists, so every call rewrites the
   whole table and resets any other previously-set button back to factory
   default (same limitation applies to `dpi-set`).
-- **Macro upload: not implemented, but the hard part is resolved.** Macro
-  creation is confirmed 100% host-side — the device never negotiates or
-  allocates an ID, so a driver is free to pick any unused one itself.
-  What's still missing is a raw capture reconciling the two described
-  upload mechanisms (`0x09` control packets vs. `0x0f`+64-byte table write)
-  into an actual byte-level packet format; referencing an existing macro by
-  ID already works (`c18ctl button <slot> macro`).
-- **Armoury (burst-fire presets): protocol fully decoded, not implemented as
-  a CLI command** — the variable-length packet format wasn't worth the added
-  surface without a concrete use case; see `PROTOCOL.md`.
-- **libratbag driver: not started** — blocked on the above.
+- **Macro creation and upload: fully decoded and working** (`c18ctl
+  macro-create <slot> <id> <mode> <key1> [key2 ...]`). Macro creation is
+  100% host-side — the device never negotiates or allocates an ID, so a
+  driver is free to pick any unused one itself — and content upload goes via
+  opcode `0x0f`, including multi-packet macros beyond one 64-byte payload
+  (verified up to 2 packets / 48 events). Inter-key wait blocks (deliberate
+  multi-second pauses) are structurally decoded but not yet calibrated or
+  implemented — see `PROTOCOL.md`.
+- **Armoury (burst-fire presets): mostly decoded, not implemented as a CLI
+  command** — repeat-mode encoding and the single-projectile fire-parameter
+  fields are confirmed, but where projectile count and cycle count are
+  actually encoded on the wire was never located (both are real, UI-enforced
+  fields — see `PROTOCOL.md`). Not implemented regardless; the
+  variable-length packet format wasn't worth the added CLI surface without a
+  concrete use case.
+- **libratbag driver: not started** — the remaining protocol gaps (macro
+  wait-block timing, Armoury projectile/cycle count encoding) are minor
+  enough that this is now the practical next step rather than something
+  blocked on further RE.
 
 See [`PROTOCOL.md`](PROTOCOL.md) for the full reverse-engineered wire protocol.
 
@@ -143,6 +151,7 @@ tail via a small Python heredoc before sending it — useful as a reference for 
 | `c18_usb_seq3.c` / `c18_usb_seq3` | Generic backend: takes a raw 64-byte hex payload and runs the same USB sequence. Used by the shell scripts. |
 | `c18*.sh` | Shell wrappers around `c18_usb_seq3` with hardcoded known-good payloads. |
 | `soai-rdesc-000B/C/D.hex` | Captured USB HID report descriptors for the mouse's 3 interfaces (standard mouse, vendor 64-byte I/O, vendor feature). |
+| `docs/vendor-software/*.png` | Screenshots of the vendor Windows configuration software's 4 tabs (Button, Performance, Lighting, Armoury) — visual reference for the UI these captures were taken against; cross-referenced from `PROTOCOL.md`. |
 | `attic/` | Retired prototype tools from the reverse-engineering process (`c18_usb`, `c18_usb_seq`, `c18_usb_seq2`, `c18_feat`, `c18_feat8`), kept for reference, not built by default. |
 
 ## Protocol summary
@@ -172,14 +181,21 @@ confirmed vs. inferred.
 
 ## Contributing captures
 
-The one functional gap left is macro *upload*. The ID question is resolved
-(macro creation is entirely host-side; the device never allocates or
-validates an ID, so a driver can pick any unused one). What's still needed
-is a raw capture of an actual macro-content upload: assign a *new* macro
-(2-3 keys is plenty) to a button and export the complete byte sequence from
-the moment "Apply/Save" is clicked, so the `0x09`-vs-`0x0f` upload-mechanism
-question can be resolved with concrete bytes — the same rigor already
-applied to the DPI stages and button table. See `PROTOCOL.md` → "Open
-items" for the full list (DPI-table bytes 7-9/40-63 and the button-remap
-trailer are also technically undecoded, but both are confirmed fixed/inert,
-so they don't block anything).
+Macro upload is resolved; the remaining gaps are smaller and more targeted:
+
+- **Macro inter-key wait blocks**: the 4-byte `[00 03][00 <value>]` pause
+  marker and its `0x7f` (127) ceiling are confirmed, but the exact
+  ms-per-unit scale isn't calibrated. Needs a stopwatch-precise single-key
+  recording with one long, precisely-timed pause (not counted out loud),
+  isolating one clean unclamped data point.
+- **Armoury projectile/cycle count encoding**: the vendor UI enforces
+  `1-8` projectiles and `1-255` cycles (see `docs/vendor-software/
+  armoury-tab.png`), but neither field's byte offset has been located —
+  only ruled out of the multi-projectile chunk's fixed 2-byte header. Needs
+  captures isolating projectile count (1 vs 2 vs 3+) and cycle count
+  independently, the same way the per-projectile interval/X/Y fields were
+  isolated.
+
+See `PROTOCOL.md` → "Open items" for the full list (DPI-table bytes 7-9/40-63
+and the button-remap trailer are also technically undecoded, but both are
+confirmed fixed/inert, so they don't block anything).

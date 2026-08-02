@@ -78,7 +78,9 @@ convention.)
 The LED implementation in `c18ctl.c` was built and verified against real
 hardware before this opcode table was decoded from Windows captures. Both
 describe the same wire protocol; here's the mapping (verified by recomputing
-each fixed packet's checksum with the formula above — all match):
+each fixed packet's checksum with the formula above — all match). See
+`docs/vendor-software/lighting-tab.png` for the vendor UI these modes/colors
+come from.
 
 | Old name in `c18ctl.c` | Bytes | = Opcode |
 |---|---|---|
@@ -134,6 +136,12 @@ device-specific.
 | 125 Hz | `0x08` |
 
 ## DPI
+
+See `docs/vendor-software/performance-tab.png` for the vendor UI — DPI
+slider (200–10000), the 5 "Configuration sensitivity level" checkboxes
+(ruled out as an explanation for the DPI table's undecoded bytes 7-9/40-63,
+see Open Items), acceleration slider (0–10), and the Rate of return / polling
+rate checkboxes (125/250/500/1000 Hz).
 
 ### Active stage select
 Opcode `0x04`, byte2 = stage number `1`-`5`. e.g. `04 01 02 00 00 00 00 f8` = select stage 2.
@@ -232,7 +240,8 @@ IRP.
 **All 11 buttons confirmed** via a full sweep — every button assigned a
 unique test key and diffed against the previous state, then cross-checked
 byte-for-byte against the vendor software's default-button-layout diagram
-(11/11 matched).
+(11/11 matched) — see `docs/vendor-software/button-tab.png` for the
+diagram itself.
 
 **Correction from an earlier capture pass**: Button 1 (the main left-click
 button) **is remappable** and occupies its own slot — this wasn't tested
@@ -549,14 +558,20 @@ from the vendor software); `c18ctl macro-create` does the full
 create-and-assign flow, generating its own event data and choosing the ID
 you pass it — see the Macros section above.
 
-## Armoury (burst-fire macro, "N Key") — protocol fully understood, not implemented in `c18ctl`
+## Armoury (burst-fire macro, "N Key") — mostly decoded, not implemented in `c18ctl`
 
 A separate, unrelated sub-protocol from the keyboard-macro system above:
 burst-fire configurator (projectile count, per-projectile strike interval,
 X/Y recoil correction, repeat mode, cycle count), managed as named presets
 ("guns"). "N Key" (not "Close the N Key", a different menu item that just
 re-exposes the `type=0x0001` click submenu) opens a popup to assign either an
-Armoury preset or a macro to a button.
+Armoury preset or a macro to a button. See `docs/vendor-software/armoury-tab.png`
+for the vendor UI — it also shows the field ranges the software enforces at
+the UI level: projectile count `1-8`, cycle count `1-255` (both UI-observed
+limits, not yet confirmed against the wire encoding — the byte-level fields
+for either aren't decoded, see Open Items). The screenshot's own values
+(X=50, Y=77, interval=900ms) match the single-projectile worked example
+below exactly — it's the actual capture session's UI state.
 
 - **Button-slot reference**: `type = 0x0c | (repeat_mode<<8)`, same 3-mode
   enum as macros. **No persistent preset index exists** — confirmed by
@@ -738,16 +753,25 @@ Genuinely still open:
   distinct from Up/Down/Cycle — not checked.
 - Whether "Disabled" is genuinely just `type=0x0000, value=0x00`, or a
   distinct explicit disable flag exists elsewhere.
-- **Armoury**: protocol fully decoded (repeat-mode encoding, confirmed no
-  persistent preset index, single- and multi-projectile fire-parameter
-  encoding with distinct interval formulas) — see the Armoury section. Not
-  implemented as a `c18ctl` command; the variable-length/presence-based
-  packet format wasn't worth the added CLI surface without a concrete use
-  case, not because anything's still unknown.
+- **Armoury**: repeat-mode encoding, confirmed no persistent preset index,
+  and the single-/multi-projectile per-projectile fields (interval, X/Y
+  correction, with distinct interval formulas for each mode) are all
+  decoded — see the Armoury section. **Not fully decoded**, though:
+  projectile *count* and cycle *count* — both real, UI-exposed fields (the
+  vendor software enforces `1-8` projectiles and `1-255` cycles, see
+  `docs/vendor-software/armoury-tab.png`) — were never located in the byte
+  layout. The multi-projectile section only established the fixed 2-byte
+  header is *not* the count (`00 01` stayed constant even in a 2-projectile
+  test); where the actual count lives (encoded in the number of 10-byte
+  chunks sent, a separate field, or something else) was never determined.
+  Not implemented as a `c18ctl` command regardless — the variable-length/
+  presence-based packet format wasn't worth the added CLI surface without a
+  concrete use case.
 
 **Not yet implemented in `c18ctl` (protocol is understood — this is pure CLI
 work, not blocked on RE)**:
-- Armoury preset upload (fire-parameter packet via `0x0f`) — see above.
+- Armoury preset upload for the **single-projectile** case (fire-parameter
+  packet via `0x0f`) — see above.
 - `c18ctl macro-create` always targets profile 1 — a driver wanting
   profile-2 macros would need to expose that.
 
@@ -758,3 +782,10 @@ work, not blocked on RE)**:
   calibrated, so `c18ctl macro-create` can't emit an accurate one yet.
   Getting a clean calibration point needs stopwatch-precise timing during a
   live recording.
+- Armoury preset upload for **2+ projectiles**, and the **cycle count**
+  field in general — the vendor UI enforces real ranges for both (`1-8`
+  projectiles, `1-255` cycles, see `docs/vendor-software/armoury-tab.png`),
+  but where either count is actually encoded on the wire was never
+  determined (only ruled out of the multi-projectile chunk's fixed header —
+  see the Armoury section). Needs a capture isolating each field the same
+  way the single-projectile fields were isolated.
