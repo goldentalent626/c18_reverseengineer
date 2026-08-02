@@ -54,15 +54,24 @@ commands (see "LED / RGB" below) — same formula, same transaction wrapper.
 | `0x02` | Select/commit active profile | `02 <profile#> 00 00 00 00 00 <checksum>` | Implemented (`c18ctl profile`, and as the commit step of every command) |
 | `0x03` | Set polling rate | `03 <profile#> <interval_ms> 00 00 00 00 <checksum>` | Implemented (`c18ctl polling`) |
 | `0x04` | Set active DPI stage | `04 <profile#> <stage 1-5> 00 00 00 00 <checksum>` | Implemented (`c18ctl dpi-stage`) |
-| `0x09` | Macro event data | `09 <event> <keycode> ...` (see Macros below) | Not implemented — ID assignment is resolved (a driver can pick any unused ID, no device negotiation needed), but the exact content-upload packet framing has no raw capture example (see Open items) |
 | `0x0c` | Prepare to write DPI table | `0c <profile#> 80 00 00 00 00 <checksum>` — precedes the DPI-table primer+data writes on endpoint `0x04` | Implemented — this is the same "prepare table" step the LED command sequence already used (previously named `FEAT_ARM`). The 64-byte DPI table write itself is implemented for all 5 stages (`c18ctl dpi-set <stage> <dpi>`). |
 | `0x0d` | Prepare to write button table | `0d <profile#> 80 00 00 00 00 <checksum>` — precedes the button-table write on endpoint `0x04` | Implemented (`c18ctl button`) |
-| `0x0f` | Prepare to upload extended per-reference data | `0f <table_type> 80 00 00 00 00 <checksum>` — general-purpose, not tied to one feature. `table_type=0x04` seen preceding both Armoury fire-parameter uploads and macro keyboard-event-data uploads (assigning any macro, even an unchanged existing one, re-triggers this and re-sends the macro's full data) | Not implemented (macro upload / Armoury fire-parameter upload out of scope — see Open items) |
+| `0x0f` | Prepare to upload extended per-reference data | `0f <target_ID> 80 00 00 00 00 <checksum>` — second byte is the **macro or Armoury preset ID** being uploaded to (not a profile number, and not a generic "table type" as an earlier version of this doc claimed), followed by that ID's full content on endpoint `0x04`. Confirmed three-for-three across independent macro-ID tests — see Macros below for the full worked example, including a multi-packet (>1 write) case. | Reference-only write (`c18ctl button <slot> macro <id>`) is implemented; sending *new* macro/Armoury content via this opcode is not — see Open items |
+
+**Note on `SET_REPORT (0x09)`**: every command in this table is sent as a USB
+HID `SET_REPORT` class request — `bRequest=0x09` in the USB control transfer
+itself. This is a **USB-level wrapper, not a payload opcode** — there is no
+"opcode `0x09`" in the payload sense. An earlier version of this doc
+mistakenly listed `0x09` here as a macro-content payload opcode; that
+confusion came from conflating it with `type=0x0009`, the unrelated
+button-slot macro-reference field (see Type/value table below). Macro
+content is actually uploaded via opcode `0x0f` above.
 
 Byte1 of opcodes `0x03`/`0x04`/`0x0c`/`0x0d` is the **target profile number**,
 confirmed by a Restore Defaults capture that exercised these opcodes on
-Profile 2 and got byte1=`02` throughout. (`0x0f`'s second byte is a *table
-type* selector, not a profile number — different convention.)
+Profile 2 and got byte1=`02` throughout. (`0x0f`'s second byte is a *target
+ID* — a macro or Armoury preset number — not a profile number; different
+convention.)
 
 ### LED / RGB — cross-reference to previously-used names
 
@@ -325,21 +334,111 @@ Windows system-menu mnemonics.
   all, only keyboard keystrokes. This matches libratbag's own macro model (an
   array of `(type, value)` tuples), so this is not a limitation for a
   libratbag driver.
-- Two different upload mechanisms have been *described* in this document but
-  never reconciled with an actual raw capture of a full macro upload:
-  opcode `0x09` `SET_REPORT` control transfers (8 bytes each), and/or
-  opcode `0x0f` (`table_type=0x04`) followed by a 64-byte write on endpoint
-  `0x04` — assigning a macro to a button (even an *existing*, unchanged one)
-  triggers the latter, resending the macro's full keyboard-event data. Which
-  of these actually carries a *new* macro's content, in what packet framing
-  (event count/length prefix, how many events fit per packet, ordering
-  relative to the button-slot reference write), has no raw byte example
-  anywhere in this document. **This is the one remaining gap** — see Open
-  items.
 - Each keyboard event = 2 bytes: `[event_byte][HID_keycode]`
   - `event_byte` bit 7 (`0x80`): `0`=press, `1`=release
   - `event_byte` bits 0–6: timing/delay value, unit not calibrated (varies with real typing rhythm)
-- The assigning button's slot gets `type = 0x0009 | (repeat_mode<<8), value=<macro ID>` — confirmed via a direct test (existing macro ID `0x0004`) and via 3 isolated repeat-mode tests. **`c18ctl button <slot> macro <id> <mode>` implements this reference side** (type/value construction, for an ID you already know) — see "Macro ID assignment" below for why the ID no longer needs to be *discovered*, even though uploading new content still isn't implemented.
+- The assigning button's slot gets `type = 0x0009 | (repeat_mode<<8), value=<macro ID>` — confirmed via a direct test (existing macro ID `0x0004`) and via 3 isolated repeat-mode tests. **`c18ctl button <slot> macro <id> <mode>` implements this reference side** (type/value construction, for an ID you already know).
+- **Content-upload mechanism — resolved** (previously the one open protocol
+  gap in this doc): macro content is uploaded via opcode `0x0f <target_ID>
+  80 ...` followed by one or more 64-byte writes on endpoint `0x04` — the ID
+  in the `0x0f` command matches the macro ID written into the button slot
+  exactly. This is the *same* mechanism used for Armoury fire-parameter
+  uploads (see Armoury below); `0x0f` is a general "upload extended data for
+  reference ID=X" signal, not macro-specific. See the full worked example
+  below. **Not yet implemented in `c18ctl`** — see Open items for why this
+  is now a pure implementation task rather than a protocol unknown.
+
+### Complete worked example (raw bytes, full transaction)
+
+Source: assigning a "1, 2, 3" keyboard macro (ID `0x1f`) to a button. All 8
+packets in order, exactly as captured:
+
+```
+1. 01 88 00 00 00 00 00 76        begin transaction
+
+2. 0d 01 80 00 00 00 00 71        prepare button table write (profile 1)
+
+3. [endpoint 0x04, 64 bytes] button table write — the assigned button's
+   slot reads: 09 00 1f 00  ->  type=0x0009, value=0x001f (macro ID 31)
+   Full payload:
+   0100f000000000000300e900000006000300ea000300b70000002c0000000000070001000800030009001f000000070000000000000000000400010004000200
+
+4. [endpoint 0x04, 64 bytes, all zero] commit/ack for the button-table write
+
+5. 0f 1f 80 00 00 00 00 51        prepare extended-data upload for
+                                    TARGET ID = 0x1f — matches the macro ID
+                                    from step 3 exactly. This is how the
+                                    device knows which macro slot the next
+                                    payload belongs to: the ID is named
+                                    explicitly in this control command, not
+                                    embedded in the content packet itself.
+
+6. [endpoint 0x04, 64 bytes] the actual macro content:
+   0001461ed61e271fc61f3e2081200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+   Decoded: header `00 01` (constant — not a length/event-count field),
+   then 6 event pairs = press "1", release "1", press "2", release "2",
+   press "3", release "3":
+     (46,1e) press '1'   (d6,1e) release '1'
+     (27,1f) press '2'   (c6,1f) release '2'
+     (3e,20) press '3'   (81,20) release '3'
+   Remaining 50 bytes are zero padding.
+
+7. [endpoint 0x04, 64 bytes, all zero] commit/ack for the content write
+
+8. 02 01 00 00 00 00 00 fc        commit / select profile 1 (closes the
+                                    transaction)
+```
+
+Cross-verified against an independent capture assigning an *existing* macro
+(ID `0x0004`), which produced the trigger `0f 04 80 00 00 00 00 6c` — target
+ID matching the button-slot reference exactly, correctly checksummed
+(`0f+04+80+0x6c = 0xFF`).
+
+- **Association with macro ID**: not embedded in the content packet at all
+  — established entirely by the preceding `0x0f <target_ID> 80 ...` control
+  command.
+- **Length/count prefix**: none identified. The `00 01` header is constant
+  (verified identical across a 6-event macro and a 12-event macro) — not an
+  event count. Events pack sequentially from byte 2 onward, zero-padded to
+  fill the packet.
+- **Events per packet**: a single packet holds ~31 events (62 bytes after
+  the 2-byte header) — see "Multi-packet macros" below for longer macros.
+- **Ordering**: button-table write (with the macro reference) happens
+  first, then its own commit/ack, then the `0x0f`-triggered content upload,
+  then its own commit/ack, then the final transaction commit — replicate
+  this exact order.
+
+### Multi-packet macros — resolved
+
+Confirmed with a 24-character macro (`1234567890-=1234567890-=`, 48 events /
+96 bytes of event data — too large for one 64-byte packet):
+
+```
+0f 04 80 00 00 00 00 6c        prepare extended-data upload, target ID=4
+                                 (checksum verified: 0x0f+0x04+0x80+0x6c = 0xFF)
+
+[endpoint 0x04, packet 1 of 2]:
+0001021e811e011f811f0120812001218121012281220123812301248124012581250126812601278127012d812d012e812e011e811e011f811f012081200121
+
+[endpoint 0x04, packet 2 of 2]:
+8121012281220123812301248124012581250126812601278127012d812d012e812e000000000000000000000000000000000000000000000000000000000000
+```
+
+- **Only one `0x0f` trigger fires for the whole macro**, not one per packet
+  — the device just expects however many consecutive 64-byte writes follow
+  on endpoint `0x04`.
+- **Packet 2 has no header** — it's a raw continuation of the event stream
+  exactly where packet 1 left off (mid-event: packet 1 ends with the
+  *press* half of the 16th character, packet 2 opens with that character's
+  *release*). The `00 01` header only appears once, at the start of packet 1.
+- Packet 1 is filled completely (31 events, all 62 content bytes used);
+  packet 2 carries the remaining 17 events and is zero-padded after that —
+  consistent with "keep writing consecutive packets until the content is
+  exhausted, then zero-pad the last one" rather than any explicit
+  length/continuation field.
+- This single test doesn't establish the exact upper limit (e.g. whether a
+  macro needing 3+ packets works the same way — see Open items), but it
+  confirms the mechanism generalizes cleanly beyond one packet.
 
 ### Macro ID assignment — resolved: no device-side negotiation exists
 
@@ -358,14 +457,15 @@ the same session, since Armoury references use the identical
 `base_type | (mode<<8)` pattern) reflect the **vendor software's own
 internal counter**, not anything the device tracks or validates.
 
-**This resolves the ID half of the problem**: a driver doesn't need to
-discover or negotiate an ID with the device — it can pick any ID not already
-in use by that profile's buttons/Armoury presets (tracked in the driver's
-own state) and send it directly in the button-slot reference write. **It
-does not resolve the content-upload half** — see the upload-mechanism note
-above and Open items. `c18ctl button <slot> macro` therefore still only
-*references* an ID (useful for an already-known macro from the vendor
-software); it does not create/upload macro content.
+**Combined with the now-resolved content-upload mechanism above**, a driver
+has everything it needs: pick any ID not already in use by that profile's
+buttons/Armoury presets (tracked in the driver's own state), then send the
+button-slot reference write followed by the `0x0f`-triggered content
+upload, exactly as shown in the worked example above. `c18ctl button <slot>
+macro` currently only *references* an existing ID (useful for an
+already-known macro from the vendor software) — implementing content
+creation/upload is now a pure CLI implementation task, not blocked on any
+remaining protocol unknown (see Open items).
 
 ## Armoury (burst-fire macro, "N Key") — protocol fully understood, not implemented in `c18ctl`
 
@@ -385,7 +485,7 @@ Armoury preset or a macro to a button.
   marker; the actual preset identity lives entirely in the freshly
   re-uploaded fire-parameter data (below) — there's no ID because the full
   parameter set is always resent on assignment.
-- **Fire-parameter packet**: triggered by opcode `0x0f` (`table_type=0x04`)
+- **Fire-parameter packet**: triggered by opcode `0x0f` (`target_ID=0x04`)
   + 64-byte write. **Single-projectile**, confirmed via an isolated
   one-field-at-a-time test:
   ```
@@ -521,25 +621,23 @@ constant, safe to cache-and-resend, exactly what `c18ctl dpi-set` already
 does — see the DPI section above); the DPI-table primer packet's *content*
 (fixed/identical in every capture — a driver just always sends this exact
 packet, even though *why* the firmware needs it isn't knowable without
-source access); and the macro/Armoury ID *allocation pattern* (sequential,
-shared pool between macros and Armoury presets, not driver-controllable).
+source access); the macro/Armoury ID *allocation pattern* (sequential,
+shared pool between macros and Armoury presets, not driver-controllable);
+and the **macro content-upload packet framing** — previously the one
+remaining protocol gap in this doc, now fully resolved with a concrete
+worked example (a 6-event macro) plus a multi-packet example (a
+48-event/24-character macro spanning 2 packets) — see the Macros section
+above. Opcode `0x0f` carries the content, keyed by the target ID named in
+the command itself; the earlier "opcode `0x09`" theory was a misreading of
+the generic `SET_REPORT` USB class request (see the note under Opcode
+summary).
 
 Genuinely still open:
 
-- **Macro upload still blocked, but not on the ID question anymore.**
-  Macro creation is now confirmed 100% host-side (an isolated create/
-  record/save capture with no button assignment produced zero USB traffic)
-  — the device never negotiates an ID, so a driver can pick any unused one
-  itself. What's still missing is a raw capture of an actual macro-content
-  upload: two upload mechanisms are described (`0x09` 8-byte control
-  packets, and/or `0x0f`+64-byte table write) but never reconciled with a
-  concrete byte example, so the packet framing (event count/length prefix,
-  events-per-packet, ordering vs. the button-slot reference write) is
-  unknown. **Need**: capture assigning a *new* macro (2-3 keys is enough) to
-  a button and export the complete raw byte sequence from the moment
-  "Apply/Save" is clicked — the same rigor already applied to DPI stages and
-  buttons. Referencing an already-known ID is implemented (`c18ctl button
-  <slot> macro`); creating/uploading content isn't.
+- Whether a macro needing **3+ packets** (more than ~48 events) follows the
+  same "keep writing consecutive packets, zero-pad the last one" pattern —
+  only tested up to 2 packets (48 events). Low risk given the mechanism
+  generalized cleanly from 1→2 packets, but not proven beyond that.
 - Bytes 28–31 and 48–63 of the **button-remap** packet: confirmed
   fixed/identical across both profiles' factory defaults and unchanged
   through the full 11-button sweep, so likely genuinely reserved — but not
@@ -561,3 +659,11 @@ Genuinely still open:
   implemented as a `c18ctl` command; the variable-length/presence-based
   packet format wasn't worth the added CLI surface without a concrete use
   case, not because anything's still unknown.
+
+**Not yet implemented in `c18ctl` (protocol is understood — this is pure CLI
+work, not blocked on RE)**:
+- Macro content creation/upload: the `0x0f` + keyboard-event-packet(s)
+  mechanism, including the multi-packet case. Reference-only assignment
+  (`c18ctl button <slot> macro <id>`) exists; there's no `c18ctl macro
+  create`/`upload` equivalent yet.
+- Armoury preset upload (fire-parameter packet via `0x0f`) — see above.
