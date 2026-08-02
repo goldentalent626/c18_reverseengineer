@@ -53,6 +53,83 @@ static const unsigned char EFFECT_TAIL_DEFAULT[24] = {
   0x31,0x00,0x31, 0x00,0x31,0x31, 0x31,0x31,0x31, 0x31,0x31,0x31
 };
 
+// DPI table template, captured while editing DPI stage 2 through multiple real
+// values (only bytes 21 and 29 — the X/Y DPI code — changed across those captures;
+// everything else here, including bytes 7-9 and 40-63, stayed fixed). Those two
+// regions are known to differ for other stages/contexts (see PROTOCOL.md), so this
+// template is only validated for stage 2. DPI_BYTE placeholder = 0x04 (200 DPI).
+static const unsigned char DPI_STAGE2_TEMPLATE[64] = {
+  0x0f,0x00,0x1e,0x0a,0x19,0x19,0x05,0x00,0x00,0x00,0x64,0x64,0x01,0xc0,0xf0,0x03,
+  0x01,0x01,0x19,0x19,0x27,0x04,0x5c,0xd0,0xf3,0x5c,0x73,0x00,0x27,0x04,0x5c,0xd0,
+  0xf3,0x5c,0x73,0x00,0x1f,0xff,0x00,0x00,0x31,0x00,0x00,0x00,0x31,0x00,0x00,0x00,
+  0x31,0x31,0x31,0x00,0x31,0x00,0x31,0x00,0x31,0x31,0x31,0x31,0x31,0x31,0x31,0x31
+};
+
+// Byte offsets of the X/Y DPI code within DPI_STAGE2_TEMPLATE / the DPI table packet.
+#define DPI_X_OFFSET 21
+#define DPI_Y_OFFSET 29
+
+// DPI value -> device byte code. Non-linear sensor register encoding; use linear
+// interpolation between confirmed points (matches doc guidance and exactly
+// reproduces every confirmed table entry, including the below-400 DPI/50 region).
+static const struct { int dpi; unsigned char byte; } DPI_CALIB[] = {
+  {200,0x04},{300,0x06},{400,0x08},{600,0x0d},{800,0x12},{1200,0x1b},{1600,0x24},
+  {2000,0x2e},{2300,0x34},{2400,0x37},{2600,0x3b},{3200,0x49},{4800,0x6f},
+  {6400,0xc9},{6600,0xcc},{10000,0xf3},
+};
+#define DPI_CALIB_N (int)(sizeof(DPI_CALIB) / sizeof(DPI_CALIB[0]))
+
+static unsigned char dpi_to_byte(int dpi) {
+  if (dpi < DPI_CALIB[0].dpi || dpi > DPI_CALIB[DPI_CALIB_N - 1].dpi) {
+    die("DPI must be in range 200-10000");
+  }
+  for (int i = 0; i < DPI_CALIB_N - 1; i++) {
+    int d0 = DPI_CALIB[i].dpi, d1 = DPI_CALIB[i + 1].dpi;
+    if (dpi >= d0 && dpi <= d1) {
+      if (d0 == d1) return DPI_CALIB[i].byte;
+      int b0 = DPI_CALIB[i].byte, b1 = DPI_CALIB[i + 1].byte;
+      return (unsigned char)(b0 + (dpi - d0) * (b1 - b0) / (d1 - d0));
+    }
+  }
+  return DPI_CALIB[DPI_CALIB_N - 1].byte;
+}
+
+// Default button table, script-verified byte-for-byte from a real capture. Bytes
+// 40-63 confirmed fixed/identical across both profiles' factory defaults (reserved,
+// not additional button slots). Used as the base for every button-table write,
+// since the device protocol has no readback: writing one button resets any other
+// previously-customized button back to this factory default.
+static const unsigned char BUTTON_DEFAULT_TABLE[64] = {
+  0x01,0x00,0xf0,0x00,0x01,0x00,0xf1,0x00,0x01,0x00,0xf2,0x00,0x01,0x00,0xf4,0x00,
+  0x01,0x00,0xf3,0x00,0x07,0x00,0x03,0x00,0x00,0x00,0x2c,0x00,0x00,0x00,0x00,0x00,
+  0x00,0x00,0x1a,0x00,0x00,0x00,0x16,0x00,0x00,0x00,0x04,0x00,0x00,0x00,0x07,0x00,
+  0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x04,0x00,0x01,0x00,0x04,0x00,0x02,0x00
+};
+
+// Byte offset of a button slot's [type LE][value LE] pair within the button table.
+// Button 2 has an extra marker+tag prefix (see PROTOCOL.md), so its type/value
+// pair is at offset 4, not 0.
+static int button_slot_offset(int slot) {
+  switch (slot) {
+    case 2: return 4;
+    case 3: return 8;
+    case 4: return 12;
+    case 5: return 16;
+    case 6: return 20;
+    case 7: return 32;
+    case 8: return 36;
+    default: die("Button slot must be 2-8"); return -1;
+  }
+}
+
+static void set_button_type_value(unsigned char payload[64], int slot, unsigned short type, unsigned short value) {
+  int off = button_slot_offset(slot);
+  payload[off + 0] = (unsigned char)(type & 0xff);
+  payload[off + 1] = (unsigned char)(type >> 8);
+  payload[off + 2] = (unsigned char)(value & 0xff);
+  payload[off + 3] = (unsigned char)(value >> 8);
+}
+
 // All 8-byte control commands share one wrapper: SET_REPORT(Feature), and every
 // command's 8 bytes sum to exactly 0xFF, i.e. checksum = 0xFF - sum(byte[0..6]).
 // Confirmed against every opcode captured, including across both DPI profiles.
@@ -249,6 +326,40 @@ static void build_payload_mode_speed(unsigned char payload[64], unsigned char mo
   memcpy(payload + 40, EFFECT_TAIL_DEFAULT, 24);
 }
 
+static void build_payload_dpi_stage2(unsigned char payload[64], int dpi) {
+  memcpy(payload, DPI_STAGE2_TEMPLATE, 64);
+  unsigned char b = dpi_to_byte(dpi);
+  payload[DPI_X_OFFSET] = b;
+  payload[DPI_Y_OFFSET] = b;
+}
+
+// USB HID Keyboard/Keypad usage page (standard, not device-specific) — matches
+// every example byte given in PROTOCOL.md's button type/value table.
+static unsigned short parse_key(const char *s) {
+  if (strlen(s) == 1) {
+    char c = s[0];
+    if (c >= 'a' && c <= 'z') return (unsigned short)(0x04 + (c - 'a'));
+    if (c >= 'A' && c <= 'Z') return (unsigned short)(0x04 + (c - 'A'));
+    if (c >= '1' && c <= '9') return (unsigned short)(0x1e + (c - '1'));
+    if (c == '0') return 0x27;
+  }
+  if ((s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))) {
+    return (unsigned short)strtol(s, NULL, 16);
+  }
+  die("key must be a single a-z/0-9 character or a 0xHH HID usage code");
+  return 0;
+}
+
+static unsigned short parse_media(const char *s) {
+  if (streq(s, "volup"))     return 0xe9;
+  if (streq(s, "voldown"))   return 0xea;
+  if (streq(s, "playpause")) return 0xcd;
+  if (streq(s, "stop"))      return 0xb7;
+  if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) return (unsigned short)strtol(s, NULL, 16);
+  die("media must be one of: volup voldown playpause stop, or 0xHH");
+  return 0;
+}
+
 static void usage(void) {
   fprintf(stderr,
     "Usage:\n"
@@ -261,15 +372,24 @@ static void usage(void) {
     "  sudo ./c18ctl profile <1|2>\n"
     "  sudo ./c18ctl polling <125|250|500|1000> [profile]\n"
     "  sudo ./c18ctl dpi-stage <1-5> [profile]\n"
+    "  sudo ./c18ctl dpi-set <stage=2> <dpi 200-10000> [profile]\n"
+    "  sudo ./c18ctl button <slot 2-8> off [profile]\n"
+    "  sudo ./c18ctl button <slot 2-8> key <a-z0-9|0xHH> [profile]\n"
+    "  sudo ./c18ctl button <slot 2-8> media <volup|voldown|playpause|stop|0xHH> [profile]\n"
+    "  sudo ./c18ctl button <slot 2-8> dpi-up|dpi-down|dpi-cycle [profile]\n"
+    "  sudo ./c18ctl button <slot 2-8> profile-up|profile-down|profile-cycle [profile]\n"
+    "  sudo ./c18ctl button <slot 2-8> native <0xHH> [profile]\n"
     "\n"
     "Colors: red green blue yellow purple cyan white off\n"
     "\n"
-    "DPI value table and button remapping are not implemented yet — see\n"
-    "PROTOCOL.md for what's decoded and what's still missing.\n"
+    "dpi-set only supports stage 2 for now (the only stage with a validated\n"
+    "capture). Each `button` call writes the WHOLE button table, resetting any\n"
+    "other previously-set button back to factory default (no readback exists).\n"
+    "See PROTOCOL.md for details and open items.\n"
   );
 }
 
-enum cmd_kind { KIND_LED, KIND_PROFILE, KIND_POLLING, KIND_DPI_STAGE };
+enum cmd_kind { KIND_LED, KIND_PROFILE, KIND_POLLING, KIND_DPI_STAGE, KIND_DPI_TABLE, KIND_BUTTON };
 
 int main(int argc, char **argv) {
   if (argc < 2) { usage(); return 2; }
@@ -320,6 +440,55 @@ int main(int argc, char **argv) {
     kind = KIND_DPI_STAGE;
     arg_byte = parse_dpi_stage(argv[2]);
     profile = parse_profile(argc >= 4 ? argv[3] : NULL);
+  } else if (streq(cmd, "dpi-set")) {
+    if (argc < 4) { usage(); return 2; }
+    if (atoi(argv[2]) != 2) die("Only DPI stage 2 is supported by dpi-set right now — see PROTOCOL.md");
+    kind = KIND_DPI_TABLE;
+    build_payload_dpi_stage2(payload, atoi(argv[3]));
+    profile = parse_profile(argc >= 5 ? argv[4] : NULL);
+  } else if (streq(cmd, "button")) {
+    if (argc < 4) { usage(); return 2; }
+    int slot = atoi(argv[2]);
+    const char *action = argv[3];
+    unsigned short btype = 0, bvalue = 0;
+    const char *profile_arg = NULL;
+
+    if (streq(action, "off")) {
+      btype = 0x0000; bvalue = 0x0000;
+      profile_arg = (argc >= 5) ? argv[4] : NULL;
+    } else if (streq(action, "key")) {
+      if (argc < 5) { usage(); return 2; }
+      btype = 0x0000; bvalue = parse_key(argv[4]);
+      profile_arg = (argc >= 6) ? argv[5] : NULL;
+    } else if (streq(action, "media")) {
+      if (argc < 5) { usage(); return 2; }
+      btype = 0x0003; bvalue = parse_media(argv[4]);
+      profile_arg = (argc >= 6) ? argv[5] : NULL;
+    } else if (streq(action, "dpi-up")) {
+      btype = 0x0007; bvalue = 0x0001; profile_arg = (argc >= 5) ? argv[4] : NULL;
+    } else if (streq(action, "dpi-down")) {
+      btype = 0x0007; bvalue = 0x0002; profile_arg = (argc >= 5) ? argv[4] : NULL;
+    } else if (streq(action, "dpi-cycle")) {
+      btype = 0x0007; bvalue = 0x0003; profile_arg = (argc >= 5) ? argv[4] : NULL;
+    } else if (streq(action, "profile-up")) {
+      btype = 0x0008; bvalue = 0x0001; profile_arg = (argc >= 5) ? argv[4] : NULL;
+    } else if (streq(action, "profile-down")) {
+      btype = 0x0008; bvalue = 0x0002; profile_arg = (argc >= 5) ? argv[4] : NULL;
+    } else if (streq(action, "profile-cycle")) {
+      btype = 0x0008; bvalue = 0x0003; profile_arg = (argc >= 5) ? argv[4] : NULL;
+    } else if (streq(action, "native")) {
+      if (argc < 5) { usage(); return 2; }
+      btype = 0x0001; bvalue = (unsigned short)strtol(argv[4], NULL, 16);
+      profile_arg = (argc >= 6) ? argv[5] : NULL;
+    } else {
+      usage();
+      return 2;
+    }
+
+    kind = KIND_BUTTON;
+    profile = parse_profile(profile_arg);
+    memcpy(payload, BUTTON_DEFAULT_TABLE, 64);
+    set_button_type_value(payload, slot, btype, bvalue);
   } else {
     usage();
     return 2;
@@ -353,20 +522,28 @@ int main(int argc, char **argv) {
 
   send_cmd(h, OP_BEGIN, 0x88, 0x00, "begin");
 
-  if (kind == KIND_LED) {
-    // Primer 64 bytes: ff ff 00... (Windows sends this)
+  const unsigned char ep_out = 0x04;
+  int xfer = 0;
+
+  if (kind == KIND_LED || kind == KIND_DPI_TABLE) {
+    // Both LED and DPI-table writes go through the same "prepare table" opcode
+    // (0x0c) and 64-byte primer — see PROTOCOL.md's note on the shared header.
     unsigned char primer[64] = {0};
     primer[0] = 0xff;
     primer[1] = 0xff;
-
-    const unsigned char ep_out = 0x04;
-    int xfer = 0;
 
     send_cmd(h, OP_PREPARE_DPI_TABLE, profile, 0x80, "prepare table");
 
     rc = out64(h, ep_out, primer, &xfer);
     if (rc || xfer != 64) fprintf(stderr, "primer out failed: rc=%d xfer=%d\n", rc, xfer);
     usleep(20000);
+
+    rc = out64(h, ep_out, payload, &xfer);
+    if (rc || xfer != 64) fprintf(stderr, "payload out failed: rc=%d xfer=%d\n", rc, xfer);
+    usleep(40000);
+  } else if (kind == KIND_BUTTON) {
+    // No primer packet for the button table (per PROTOCOL.md).
+    send_cmd(h, OP_PREPARE_BUTTON_TABLE, profile, 0x80, "prepare button table");
 
     rc = out64(h, ep_out, payload, &xfer);
     if (rc || xfer != 64) fprintf(stderr, "payload out failed: rc=%d xfer=%d\n", rc, xfer);

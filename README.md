@@ -1,19 +1,23 @@
-# SOAI C18 Mouse — Linux LED Control
+# SOAI C18 Mouse — Linux Control CLI
 
 Reverse-engineered USB HID protocol for the SOAI C18 gaming mouse (USB VID:PID
-`12c9:2003`), with a working Linux CLI for controlling its RGB lighting. Long-term
-goal is a full [libratbag](https://github.com/libratbag/libratbag) driver so the
-mouse can be configured on Linux via Piper, covering LEDs, DPI, and button remapping.
+`12c9:2003`), with a working Linux CLI (`c18ctl`) covering RGB lighting, profile
+select, polling rate, DPI active-stage select, DPI stage-2 value, and button
+remapping. Long-term goal is a full
+[libratbag](https://github.com/libratbag/libratbag) driver so the mouse can be
+configured on Linux via Piper.
 
 ## Status
 
-- **LED/lighting protocol: fully decoded and working.** off, static color/brightness,
-  neon, breathing, flowing, and wave modes are all implemented in `c18ctl`.
-- **Profile select, polling rate, and DPI active-stage select: decoded and working**
+- **LED/lighting: fully decoded and working.** off, static color/brightness,
+  neon, breathing, flowing, and wave modes.
+- **Profile select, polling rate, DPI active-stage select: decoded and working**
   (`c18ctl profile|polling|dpi-stage`).
-- **DPI value table (per-stage DPI numbers) and button remapping: protocol partially
-  decoded, not yet implemented** — blocked on incomplete/inconsistent capture data.
-  See `PROTOCOL.md` → "Open items" for exactly what's missing.
+- **DPI stage-2 value: decoded and working** (`c18ctl dpi-set 2 <dpi>`). Stages
+  1/3/4/5 aren't captured yet — see `PROTOCOL.md` → "Open items".
+- **Button remapping: decoded and working** (`c18ctl button`), with a real
+  limitation: no readback exists, so every call rewrites the whole table and
+  resets any other previously-set button back to factory default.
 - **Macro upload: not implemented** — the macro-slot-ID assignment mechanism isn't
   understood yet.
 - **libratbag driver: not started** — blocked on the above.
@@ -54,12 +58,24 @@ sudo ./c18ctl wave      <fast|mid|slow>
 sudo ./c18ctl profile    <1|2>
 sudo ./c18ctl polling    <125|250|500|1000> [profile]
 sudo ./c18ctl dpi-stage  <1-5> [profile]
+sudo ./c18ctl dpi-set    <stage=2> <dpi 200-10000> [profile]
+
+sudo ./c18ctl button <slot 2-8> off [profile]
+sudo ./c18ctl button <slot 2-8> key <a-z0-9|0xHH> [profile]
+sudo ./c18ctl button <slot 2-8> media <volup|voldown|playpause|stop|0xHH> [profile]
+sudo ./c18ctl button <slot 2-8> dpi-up|dpi-down|dpi-cycle [profile]
+sudo ./c18ctl button <slot 2-8> profile-up|profile-down|profile-cycle [profile]
+sudo ./c18ctl button <slot 2-8> native <0xHH> [profile]
 ```
 
 Colors: `red green blue yellow purple cyan white off`
 
-`profile`/`polling`/`dpi-stage` default to profile 1 when the optional
-`[profile]` argument is omitted.
+All commands default to profile 1 when the optional `[profile]` argument is
+omitted. `dpi-set` only supports stage 2 right now (the only stage with a
+validated capture — see `PROTOCOL.md`). Every `button` call rewrites the whole
+64-byte button table, so it resets any other previously-set button on that
+profile back to factory default — there's no way to read the device's current
+table back to preserve it.
 
 Example:
 
@@ -124,10 +140,10 @@ confirmed vs. inferred.
 
 ## Contributing captures
 
-DPI value-table and button-remap writes are the main gap — the protocol is
-partially decoded (see `PROTOCOL.md` → "Open items") but the captured default-table
-dumps are incomplete/inconsistent (wrong byte counts, and the button table's bytes
-40–63 were never recorded). What's needed: a fresh Wireshark + USBPcap capture
-(filtered to `usb.idVendor == 0x12c9 && usb.idProduct == 0x2003`) of the DPI table
-write for each of the 5 stages, and of a button-remap write, with the full raw
-64-byte payloads exported (not hand-transcribed) so byte counts can be verified.
+DPI stages 1, 3, 4, and 5 are the main gap — only stage 2 has a validated
+capture (`c18ctl dpi-set` is deliberately restricted to stage 2 because of
+this). See `PROTOCOL.md` → "Open items" for what's needed: a Wireshark +
+USBPcap capture (filtered to `usb.idVendor == 0x12c9 && usb.idProduct ==
+0x2003`) of a DPI-table write for each remaining stage, edited through several
+different DPI values each (like the existing stage-2 capture), with the full
+raw 64-byte payloads exported (not hand-transcribed).
