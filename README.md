@@ -30,17 +30,16 @@ configured on Linux via Piper.
   (verified up to 2 packets / 48 events). Inter-key wait blocks (deliberate
   multi-second pauses) are structurally decoded but not yet calibrated or
   implemented — see `PROTOCOL.md`.
-- **Armoury (burst-fire presets): mostly decoded, not implemented as a CLI
-  command** — repeat-mode encoding and the single-projectile fire-parameter
-  fields are confirmed, but where projectile count and cycle count are
-  actually encoded on the wire was never located (both are real, UI-enforced
-  fields — see `PROTOCOL.md`). Not implemented regardless; the
-  variable-length packet format wasn't worth the added CLI surface without a
-  concrete use case.
-- **libratbag driver: not started** — the remaining protocol gaps (macro
-  wait-block timing, Armoury projectile/cycle count encoding) are minor
-  enough that this is now the practical next step rather than something
-  blocked on further RE.
+- **Armoury (burst-fire presets): fully decoded, not implemented as a CLI
+  command** — repeat-mode encoding, single-/multi-projectile fire-parameter
+  fields, cycle count (a raw byte, 1-255), and projectile count (implicit —
+  the device just counts how many projectile chunks are in the packet, no
+  explicit length field) are all confirmed — see `PROTOCOL.md`. Not
+  implemented regardless; the variable-length packet format wasn't worth the
+  added CLI surface without a concrete use case.
+- **libratbag driver: not started** — the one remaining protocol gap (macro
+  wait-block timing calibration) is minor enough that this is now the
+  practical next step rather than something blocked on further RE.
 
 See [`PROTOCOL.md`](PROTOCOL.md) for the full reverse-engineered wire protocol.
 
@@ -181,21 +180,15 @@ confirmed vs. inferred.
 
 ## Contributing captures
 
-Macro upload is resolved; the remaining gaps are smaller and more targeted:
+Macro upload and Armoury are both resolved. The one real gap left:
 
 - **Macro inter-key wait blocks**: the 4-byte `[00 03][00 <value>]` pause
   marker and its `0x7f` (127) ceiling are confirmed, but the exact
   ms-per-unit scale isn't calibrated. Needs a stopwatch-precise single-key
   recording with one long, precisely-timed pause (not counted out loud),
   isolating one clean unclamped data point.
-- **Armoury projectile/cycle count encoding**: the vendor UI enforces
-  `1-8` projectiles and `1-255` cycles (see `docs/vendor-software/
-  armoury-tab.png`), but neither field's byte offset has been located —
-  only ruled out of the multi-projectile chunk's fixed 2-byte header. Needs
-  captures isolating projectile count (1 vs 2 vs 3+) and cycle count
-  independently, the same way the per-projectile interval/X/Y fields were
-  isolated.
 
-See `PROTOCOL.md` → "Open items" for the full list (DPI-table bytes 7-9/40-63
-and the button-remap trailer are also technically undecoded, but both are
-confirmed fixed/inert, so they don't block anything).
+See `PROTOCOL.md` → "Open items" for the full list (DPI-table bytes 7-9/40-63,
+the button-remap trailer, and whether macros needing 3+ content packets or
+independent X/Y DPI values work as expected are also technically untested,
+but none of these block anything).

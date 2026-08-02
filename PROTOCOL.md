@@ -317,7 +317,7 @@ one matches:
 | `0x0009 \| (repeat_mode<<8)` | Macro reference | `value` = macro slot ID assigned when the macro was created (e.g. `0x1f`, `0x22`) — not a fixed/predictable ID. `repeat_mode`: `0x00`="repeat N or interrupt", `0x01`="repeat until interrupted", `0x02`="repeat until released". This *references* an existing macro; this tool cannot create/upload one (see Macros below). | `button <slot> macro <0xHH id> <once\|until-interrupted\|until-released>` |
 | `0xf00a` | Combo Key (Double-click / Three Click / Fire Button — all the same mechanism) | `value` = `[byte6: Delay ms, signed, capped ~127][byte7: Times, repeat count 0-255]`. Double-click = Delay 50ms/Times 2, Three Click = Delay 22ms/Times 3. | `button <slot> combo <times> <delay_ms>` |
 | `0x000b` | Exact Control | Fixed `value=0x0f0f` — no settings dialog exists, this is the full encoding. Functional meaning unclear, but the wire encoding is settled. | `button <slot> exact-control` |
-| `0x0c \| (repeat_mode<<8)` | Armoury (burst-fire preset) reference | Same 3-mode repeat enum as macros. `value` presumably a preset index, but not cross-checked against more than one preset. | **Not implemented** — preset-index semantics unconfirmed, see Open items |
+| `0x0c \| (repeat_mode<<8)` | Armoury (burst-fire preset) reference | Same 3-mode repeat enum as macros. `value` is a fixed `0x0400` marker, not a preset index — confirmed identical across two different named presets ("Armoury1"/"Armoury2"); the device has no persistent per-preset ID, see Armoury section. | **Not implemented** — protocol fully decoded, just not built as a CLI command, see Armoury section |
 
 ### Modifier encoding (confirmed)
 
@@ -558,7 +558,7 @@ from the vendor software); `c18ctl macro-create` does the full
 create-and-assign flow, generating its own event data and choosing the ID
 you pass it — see the Macros section above.
 
-## Armoury (burst-fire macro, "N Key") — mostly decoded, not implemented in `c18ctl`
+## Armoury (burst-fire macro, "N Key") — fully decoded, not implemented in `c18ctl`
 
 A separate, unrelated sub-protocol from the keyboard-macro system above:
 burst-fire configurator (projectile count, per-projectile strike interval,
@@ -566,12 +566,9 @@ X/Y recoil correction, repeat mode, cycle count), managed as named presets
 ("guns"). "N Key" (not "Close the N Key", a different menu item that just
 re-exposes the `type=0x0001` click submenu) opens a popup to assign either an
 Armoury preset or a macro to a button. See `docs/vendor-software/armoury-tab.png`
-for the vendor UI — it also shows the field ranges the software enforces at
-the UI level: projectile count `1-8`, cycle count `1-255` (both UI-observed
-limits, not yet confirmed against the wire encoding — the byte-level fields
-for either aren't decoded, see Open Items). The screenshot's own values
-(X=50, Y=77, interval=900ms) match the single-projectile worked example
-below exactly — it's the actual capture session's UI state.
+for the vendor UI — the screenshot's own values (X=50, Y=77, interval=900ms)
+match the single-projectile worked example below exactly — it's the actual
+capture session's UI state.
 
 - **Button-slot reference**: `type = 0x0c | (repeat_mode<<8)`, same 3-mode
   enum as macros. **No persistent preset index exists** — confirmed by
@@ -586,8 +583,11 @@ below exactly — it's the actual capture session's UI state.
   + 64-byte write. **Single-projectile**, confirmed via an isolated
   one-field-at-a-time test:
   ```
-  byte[0-3]: 00 01 02 f0     <- fixed header (NOT projectile count — stays
-                                  "00 01" even with multiple projectiles)
+  byte[0]:   00 (constant in every test so far — role still unclear)
+  byte[1]:   cycle count, raw byte value 1-255 (see "Projectile/cycle
+             count" below — earlier passes mistook this for part of a
+             fixed header; it just defaulted to 0x01 until varied)
+  byte[2-3]: 02 f0 (fixed)
   byte[4]:   0x81 (no X/Y correction) or 0x82 (X/Y correction active)
   byte[5]:   f0 (constant)
   [if active] X offset:  LE 16-bit, unsigned (50 -> 0x0032)
@@ -602,9 +602,11 @@ below exactly — it's the actual capture session's UI state.
   single-projectile format — confirmed via a clean 2-projectile test with
   fully distinct per-projectile values:
   ```
-  byte[0-1]: 00 01                    <- fixed file header (not projectile count)
-  Then one 10-byte chunk per projectile:
-    byte[0-3]: 02 f0 82 f0             <- fixed chunk header
+  byte[0]:   00 (same role as single-projectile)
+  byte[1]:   cycle count (see below) — 0x01 (default) in this test
+  Then one 10-byte chunk per projectile with custom interval/X/Y, or a
+  shorter 4-byte chunk per projectile left at default (see below):
+    byte[0-3]: 02 f0 82 f0             <- fixed chunk header (customized)
     byte[4-5]: strike interval, LE 16-bit = 0xf901 + (interval_ms / 2)
                confirmed: 40ms -> 0xf915, 80ms -> 0xf929
     byte[6-7]: X offset, LE 16-bit, unsigned (11 -> 0x000b, 33 -> 0x0021)
@@ -612,6 +614,34 @@ below exactly — it's the actual capture session's UI state.
   ```
   Distinct interval formula from single-projectile mode (`0xf901 + ms/2` vs
   `0x0200 + ms/20`) — not an approximation of it.
+- **Projectile count and cycle count — both resolved.** Earlier passes
+  called `byte[0-1]` a "fixed header" (`00 01`) — it was never fixed, `01`
+  was just the default cycle count until deliberately varied.
+  - **Cycle count = `byte[1]`**, raw 1-255. Confirmed by an isolated test:
+    a 1-projectile preset at cycles=1 gave `byte[1]=0x01`; changing *only*
+    cycles to 255 gave `byte[1]=0xff` — the **only** byte that changed
+    anywhere in the 64-byte packet:
+    ```
+    cycles=1:   000102f0b2f000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+    cycles=255: 00ff02f0b2f000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+    ```
+  - **Projectile count is purely implicit — no explicit count field.**
+    Confirmed by setting 8 projectiles (UI max) at default interval/X/Y,
+    cycles held at 1:
+    ```
+    000102f0b2f002f0b2f002f0b2f002f0b2f002f0b2f002f0b2f002f0b2f002f0b2f0000000000000000000000000000000000000000000000000000000000000
+    ```
+    Decodes as header `00 01` (cycles=1) followed by **exactly 8**
+    repetitions of a **4-byte "default projectile" chunk** (`02 f0 b2 f0`)
+    — a shorter form than the 10-byte customized chunk above: when a
+    projectile isn't customized, its chunk shrinks to just the 4-byte
+    header/flag portion, no interval/X/Y fields at all. No byte anywhere
+    encodes "8" — the device counts projectiles by how many chunks are in
+    the packet, the same "no length field, infer from content" pattern
+    already confirmed for macro event data.
+  - **Driver implication**: to set N projectiles, emit N chunks (4-byte
+    default form, or 10-byte form for a customized projectile) — no count
+    field to compute. To set cycle count, write it directly into `byte[1]`.
 - **Not implemented in `c18ctl`** — the protocol is now fully decoded, but
   the variable-length/presence-based packet format (different for 0/1/2+
   projectiles) is enough added complexity that it wasn't worth building a
@@ -753,25 +783,21 @@ Genuinely still open:
   distinct from Up/Down/Cycle — not checked.
 - Whether "Disabled" is genuinely just `type=0x0000, value=0x00`, or a
   distinct explicit disable flag exists elsewhere.
-- **Armoury**: repeat-mode encoding, confirmed no persistent preset index,
-  and the single-/multi-projectile per-projectile fields (interval, X/Y
-  correction, with distinct interval formulas for each mode) are all
-  decoded — see the Armoury section. **Not fully decoded**, though:
-  projectile *count* and cycle *count* — both real, UI-exposed fields (the
-  vendor software enforces `1-8` projectiles and `1-255` cycles, see
-  `docs/vendor-software/armoury-tab.png`) — were never located in the byte
-  layout. The multi-projectile section only established the fixed 2-byte
-  header is *not* the count (`00 01` stayed constant even in a 2-projectile
-  test); where the actual count lives (encoded in the number of 10-byte
-  chunks sent, a separate field, or something else) was never determined.
-  Not implemented as a `c18ctl` command regardless — the variable-length/
-  presence-based packet format wasn't worth the added CLI surface without a
-  concrete use case.
+- **Armoury**: fully resolved — repeat-mode encoding, confirmed no
+  persistent preset index, single-/multi-projectile per-projectile fields
+  (interval, X/Y correction, distinct interval formulas per mode), and both
+  previously-open count fields: cycle count (`byte[1]` of the fire-parameter
+  packet, raw 1-255) and projectile count (purely implicit — one 4-or-10-byte
+  chunk per projectile, no explicit count field) — see the Armoury section
+  for the isolated tests confirming each. Not implemented as a `c18ctl`
+  command — the variable-length/presence-based packet format wasn't worth
+  the added CLI surface without a concrete use case, not because anything's
+  still unknown.
 
 **Not yet implemented in `c18ctl` (protocol is understood — this is pure CLI
 work, not blocked on RE)**:
-- Armoury preset upload for the **single-projectile** case (fire-parameter
-  packet via `0x0f`) — see above.
+- Armoury preset upload, including multi-projectile and cycle count
+  (fire-parameter packet via `0x0f`) — see the Armoury section.
 - `c18ctl macro-create` always targets profile 1 — a driver wanting
   profile-2 macros would need to expose that.
 
@@ -782,10 +808,6 @@ work, not blocked on RE)**:
   calibrated, so `c18ctl macro-create` can't emit an accurate one yet.
   Getting a clean calibration point needs stopwatch-precise timing during a
   live recording.
-- Armoury preset upload for **2+ projectiles**, and the **cycle count**
-  field in general — the vendor UI enforces real ranges for both (`1-8`
-  projectiles, `1-255` cycles, see `docs/vendor-software/armoury-tab.png`),
-  but where either count is actually encoded on the wire was never
-  determined (only ruled out of the multi-projectile chunk's fixed header —
-  see the Armoury section). Needs a capture isolating each field the same
-  way the single-projectile fields were isolated.
+- DPI table X/Y independence — every DPI test this session set the X-DPI and
+  Y-DPI bytes to the same value; whether the vendor software (or the device)
+  supports setting them independently was never exercised.
