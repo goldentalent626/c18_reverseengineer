@@ -347,10 +347,68 @@ Windows system-menu mnemonics.
   - `event_byte` bit 7 (`0x80`): `0`=press, `1`=release
   - `event_byte` bits 0–6: **short** timing value — appears to represent how
     long the key was physically held (naturally brief, tens of ms), not
-    inter-key pause time. Unit not calibrated, but a driver defaulting this
-    to zero (immediate press/release) is a safe, harmless choice — it's a
-    separate field from the actual inter-key delay mechanism below, and
-    exactly what `c18ctl macro-create` already does.
+    inter-key pause time. Unit not calibrated.
+  - **Correction, confirmed via real hardware testing (libratbag driver
+    bring-up)**: a value of exactly `0` here is **not** a safe/harmless
+    default as earlier versions of this doc claimed — it makes the device's
+    macro player either silently no-op the button press (`repeat_mode=0x00`)
+    or hang the device outright on press (`repeat_mode=0x01`/`0x02`), even
+    though the upload transaction itself always completes and is
+    acknowledged cleanly (confirmed via the device's `GET_REPORT` status
+    echo, see the Feature-report note below). A small non-zero value that
+    isn't identical across every event works correctly — e.g. the
+    "no delay" recording mode's own real captured bytes (see "Two distinct
+    macro recording modes" below) use `1`/`2`, never `0` and never a single
+    repeated constant. **`c18ctl macro-create` and the libratbag driver now
+    emit small incrementing values instead of zero** — exact required
+    precision beyond "small, non-zero, non-repeating" is still unconfirmed.
+  - **The device's 8-byte Feature report (report ID 0) is not write-only.**
+    A `GET_REPORT` (`bRequest=0x01`, same `wValue=0x0300`) returns a live,
+    monotonically-increasing status/counter value (bytes 3-4 of the reply)
+    that tracks every command sent, including through a full macro-content
+    upload and commit — contradicting this doc's long-standing "the device
+    has zero readback" assumption for *this* channel specifically (DPI/
+    button/profile *table contents* still have no readback — this is a
+    generic command-echo/counter, not a way to read back configuration).
+
+### Two distinct macro recording modes — previously undocumented
+
+The vendor software's Macro Manager has a **"The delay time between the
+record keys" checkbox** in its Recording Options panel. Macros recorded
+different ways produce **structurally different byte payloads**, not just
+different timing values — a driver/parser that assumes every macro has the
+same shape (with or without wait-blocks, and with meaningfully-varied vs.
+near-minimal per-event timing bytes) will mishandle whichever kind it
+wasn't built for:
+
+- **No captured timing** (a plain 2-key press-'1'-press-'2' macro, "today"):
+  the Macro Manager's own "Key sequence" display shows **no timing icons at
+  all** between steps. Raw content bytes: `0001021e811e011f811f00...` —
+  decodes to header `00 01`, then press '1' (timing=`2`), release '1'
+  (timing=`1`), press '2' (timing=`1`), release '2' (timing=`1`), **no
+  wait-blocks at all** even though real time obviously passed during
+  recording. Timing values are small (`1`-`2`) but never exactly `0`.
+- **Full captured timing** (a 3-key macro with real pauses, "delay2"): the
+  Key sequence display shows explicit millisecond values for every step
+  (`93 ms`, `2282 ms`, `78 ms`, `1953 ms`, `94 ms`). Raw bytes include real
+  wait-blocks for the two long gaps (see calibrated formula below) plus
+  non-trivial, non-repeating per-event timing bytes (`46`, `16`, `39`, `2`,
+  `47`, `1`) for the short hold times — see the wait-block worked example
+  immediately below, which is this exact macro.
+
+**Caveat on the checkbox's exact causal role**: the checkbox was observed
+unchecked when *viewing* either existing macro afterward (viewing a saved
+macro doesn't seem to reflect what it was originally recorded with — it
+likely only governs the *next new* recording), so the checkbox's precise
+mechanism wasn't confirmed with full certainty in one unambiguous test. What
+*is* confirmed: **two structurally different macro forms exist and must
+both be handled** — one with no wait-blocks and near-minimal per-event
+timing, one with real wait-blocks and naturally-varied timing. Driver
+implication: prefer the "no captured timing" shape for synthesized macros
+(no wait-blocks, small non-zero non-repeating timing bytes) — this is the
+shape confirmed to actually play back correctly, whereas a synthesized
+macro using literal `0` for every timing byte does not (see the
+Feature-report readback note above).
 
 ### Inter-key wait blocks (long pauses)
 
@@ -405,21 +463,35 @@ pair (not present before the very first key). Confirmed via two live tests:
   time) rather than a non-linear encoding — but this reasoning, unlike the
   clamp finding itself, can't be independently re-verified from the bytes
   alone; it rests on trusting the stated real-world timing of each test.
-- **Exact ms-per-unit scale not established** — getting a clean unclamped
-  calibration point requires stopwatch-precise timing during a live
-  recording, which proved too fiddly to execute reliably by hand and wasn't
-  pursued further. What's solid and independently verifiable from the raw
-  bytes above: the mechanism's existence, its 4-byte structure, the fixed
-  `00 03` marker, and the `0x7f` ceiling. What rests on weaker evidence: the
-  claim that the low-precision test's non-linearity is explained by timing
-  error rather than something else.
-- **Driver implication**: a driver can safely support *short* macros with no
-  inter-key pauses (the common case) using zero for the per-event delay
-  bits, exactly as already implemented. Supporting deliberate multi-second
-  pauses would need this wait-block structure, but without a precise scale,
-  a driver should either avoid emitting them, or treat any requested pause
-  as approximate/best-effort until this is recalibrated. **Not implemented
-  in `c18ctl macro-create`** — see Open items.
+- **Calibrated: `raw = round(delay_ms / 50)`** — confirmed exactly against
+  the vendor software's own displayed timing values (its "Key sequence"
+  view shows the real millisecond delay for each step), which is more
+  reliable ground truth than the earlier stopwatch/counted-out attempts.
+  Source: a 3-key macro ("delay2") with two real pauses, full 64-byte
+  content payload:
+  ```
+  00012e1e901e0003002d271f821f000300272f208120000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+  ```
+  Decodes as header `00 01`, press '1' (`2e`=46), release '1' (`90`&0x7f=16),
+  **wait-block `00 03 00 2d`** (`0x2d`=45 → `45×50=2250ms`, UI showed
+  `2282ms` — 1.4% off), press '2' (`27`=39), release '2' (`82`&0x7f=2),
+  **wait-block `00 03 00 27`** (`0x27`=39 → `39×50=1950ms`, UI showed
+  `1953ms` — essentially exact), press '3' (`2f`=47), release '3'
+  (`81`&0x7f=1). Independently re-verified by direct computation, not
+  transcribed from the original write-up. This retroactively confirms the
+  `0x7f` (127) ceiling found earlier (`127×50=6350ms` max representable
+  wait) and explains the older counted-out test's `26,32,44,48` values as
+  counting imprecision (`26×50=1300ms` etc., all shorter than the counted
+  seconds — a known, common effect of counting seconds aloud), not a
+  different formula.
+- **Driver implication**: a driver can now compute exact wait-block values
+  for any requested pause up to 6350ms using `round(ms / 50)`, clamped to
+  `0x7f` above that. **Still not implemented in `c18ctl macro-create` or
+  the libratbag driver** — both currently skip `RATBAG_MACRO_EVENT_WAIT`
+  events entirely rather than emitting a wait-block; the formula above is
+  ready to use whenever that's picked up. The per-event hold-duration field
+  (separate from wait-blocks) is a different matter — see the correction
+  above; it must be small and non-zero, not simply "safe to leave at 0."
 
 - The assigning button's slot gets `type = 0x0009 | (repeat_mode<<8), value=<macro ID>` — confirmed via a direct test (existing macro ID `0x0004`) and via 3 isolated repeat-mode tests. **`c18ctl button <slot> macro <id> <mode>` implements this reference side** (type/value construction, for an ID you already know).
 - **Content-upload mechanism — resolved** (previously the one open protocol
@@ -432,12 +504,17 @@ pair (not present before the very first key). Confirmed via two live tests:
   below. **Implemented** — `c18ctl macro-create <slot> <0xHH id> <mode>
   <key1> [key2 ...]` sends the button-slot write, its ack, the `0x0f`
   trigger, and the multi-packet content upload in one transaction, choosing
-  the ID as described in "Macro ID assignment" below. It always emits
-  `event_byte` with the delay bits zeroed (see the event-byte note above —
-  the real unit/meaning is uncalibrated, so 0 is as valid as any other
-  value) and always targets profile 1 (not yet exposed as a CLI option).
-  Verified only up to 2 content packets (48 events) — see Open items for
-  the 3+ packet caveat.
+  the ID as described in "Macro ID assignment" below. **Upload is
+  hardware-confirmed working** (the transaction always completes and is
+  acknowledged, see the Feature-report readback note above) but **playback
+  is still being worked out**: a uniform non-zero `event_byte` timing value
+  is not sufficient on its own (confirmed: reproduced the same failure as
+  `0`), while small, non-repeating, incrementing values have shown correct
+  playback in isolated testing (see the correction above). `c18ctl.c`'s
+  current implementation has not yet been updated past a uniform value and
+  needs the same fix applied and verified. Always targets profile 1 (not
+  yet exposed as a CLI option). Verified only up to 2 content packets (48
+  events) — see Open items for the 3+ packet caveat.
 
 ### Complete worked example (raw bytes, full transaction)
 
@@ -773,10 +850,13 @@ Genuinely still open:
   through the full 11-button sweep, so likely genuinely reserved — but not
   proven via a test that specifically targeted this region.
 - `c18ctl button` and `c18ctl dpi-set` both write their whole table from a
-  factory-default template every time (no readback exists to preserve
-  current state) — setting one button/stage resets every other
-  button/stage on that profile back to factory default. A real driver needs
-  to track full table state client-side to avoid this.
+  factory-default template every time (no readback of actual DPI/button
+  *table contents* exists to preserve current state — see the note above
+  about the Feature report's status/counter readback, which is a different,
+  unrelated thing) — setting one button/stage resets every other
+  button/stage on that profile back to factory default. The libratbag
+  driver fixes this by tracking full table state client-side across calls
+  within one session; `c18ctl` itself still doesn't.
 - Exact analytic formula (if any) for the DPI byte encoding above ~4800 DPI
   (cosmetic only — the lookup table with interpolation already covers it).
 - Whether "Sniper Mode" (hold-to-lower-DPI) or a "DPI Reset" function exists
@@ -801,13 +881,13 @@ work, not blocked on RE)**:
 - `c18ctl macro-create` always targets profile 1 — a driver wanting
   profile-2 macros would need to expose that.
 
-**Not yet implemented, and still blocked on RE**:
+**Not yet implemented (protocol is now understood, this is pure CLI/driver
+work)**:
 - Inter-key wait blocks (deliberate multi-second pauses in a macro) — the
-  4-byte `[00 03][00 <value>]` block structure and its `0x7f` ceiling are
-  confirmed (see the Macros section), but the exact ms-per-unit scale isn't
-  calibrated, so `c18ctl macro-create` can't emit an accurate one yet.
-  Getting a clean calibration point needs stopwatch-precise timing during a
-  live recording.
+  4-byte `[00 03][00 <value>]` block structure, its `0x7f` ceiling, and now
+  the exact `raw = round(ms / 50)` scale are all confirmed (see the Macros
+  section) — `c18ctl macro-create` and the libratbag driver both still just
+  skip wait events entirely rather than emitting a real wait-block.
 - DPI table X/Y independence — every DPI test this session set the X-DPI and
   Y-DPI bytes to the same value; whether the vendor software (or the device)
   supports setting them independently was never exercised.
