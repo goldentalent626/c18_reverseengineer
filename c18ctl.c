@@ -439,9 +439,17 @@ static unsigned char parse_macro_mode(const char *s) {
 
 // Builds a macro's full keyboard-event byte stream: `00 01` header followed
 // by press-then-release `[event_byte][keycode]` pairs for each key (see
-// PROTOCOL.md's Macros section). event_byte's low 7 bits are an uncalibrated
-// timing/delay value that real captures show varying with actual typing
-// rhythm — meaning/unit unknown, so we always emit 0 here.
+// PROTOCOL.md's Macros section). event_byte's low 7 bits are a hold-duration
+// timing value - confirmed via hardware testing (see macro_probe.c) that a
+// value of exactly 0 makes the device's macro player either silently no-op
+// or hang the device outright on button press, even though the upload
+// transaction itself always completes fine. A UNIFORM non-zero value (every
+// event using the same constant) reproduces the same failure - confirmed by
+// testing 0x14 for every event. What actually works: small, non-zero,
+// NON-REPEATING values, incrementing across events - matching the shape of
+// PROTOCOL.md's real captured "no delay" macro (values 1,1,1,2, never 0,
+// never repeated in sequence). Exact required precision beyond that is
+// unconfirmed.
 static int build_macro_events(unsigned char *buf, int buf_cap, const unsigned short *keys, int n_keys) {
   int len = 2 + n_keys * 4;
   if (len > buf_cap) die("macro too long");
@@ -449,10 +457,13 @@ static int build_macro_events(unsigned char *buf, int buf_cap, const unsigned sh
   buf[0] = 0x00;
   buf[1] = 0x01;
   int off = 2;
+  unsigned char timing = 0x01;
   for (int i = 0; i < n_keys; i++) {
-    buf[off++] = 0x00;                        // press, no delay
+    buf[off++] = timing;                          // press
+    timing = (timing >= 0x7f) ? 1 : timing + 1;    // stay in 7 bits, never 0
     buf[off++] = (unsigned char)keys[i];
-    buf[off++] = 0x80;                        // release, no delay
+    buf[off++] = 0x80 | timing;                    // release
+    timing = (timing >= 0x7f) ? 1 : timing + 1;
     buf[off++] = (unsigned char)keys[i];
   }
   return len;

@@ -85,8 +85,10 @@ static unsigned char BUTTON_TABLE[64] = {
 
 int main(int argc, char **argv) {
   unsigned char mode = 0x00;
+  unsigned char macro_id = 0x20;
   if (argc >= 2) mode = (unsigned char)strtol(argv[1], NULL, 0);
-  printf("Using repeat_mode=0x%02x\n", mode);
+  if (argc >= 3) macro_id = (unsigned char)strtol(argv[2], NULL, 0);
+  printf("Using repeat_mode=0x%02x macro_id=0x%02x\n", mode, macro_id);
 
   libusb_context *ctx = NULL;
   libusb_device_handle *h = NULL;
@@ -104,9 +106,9 @@ int main(int argc, char **argv) {
     if (rc) { fprintf(stderr, "claim interface %d failed: %d\n", ifaces[i], rc); return 1; }
   }
 
-  // patch slot 7 (offset 32) to macro ref: type=0x0009|(mode<<8), value=0x0020
+  // patch slot 7 (offset 32) to macro ref: type=0x0009|(mode<<8), value=macro_id
   BUTTON_TABLE[32] = 0x09; BUTTON_TABLE[33] = mode;
-  BUTTON_TABLE[34] = 0x20; BUTTON_TABLE[35] = 0x00;
+  BUTTON_TABLE[34] = macro_id; BUTTON_TABLE[35] = 0x00;
 
   poll_status(h, "(nothing yet, baseline)");
 
@@ -122,16 +124,25 @@ int main(int argc, char **argv) {
   usleep(20000);
   poll_status(h, "button table ack out64");
 
-  send_cmd(h, 0x0f, 0x20, 0x80, "prepare macro content (id 0x20)");
+  send_cmd(h, 0x0f, macro_id, 0x80, "prepare macro content");
 
-  // macro content: header 00 01, then press/release '1' '2' '3'
+  // macro content: header 00 01, then press/release '1' '2' '3'.
+  // Testing a new theory: a FIXED repeated timing value (0x14 press /
+  // 0x94 release for every event) reproduced the "volume up" failure
+  // symptom, even though it's non-zero - ruling out "any non-zero value
+  // works". PROTOCOL.md's real captured example never repeats a value
+  // and press != release for the same key (0x46 vs 0x56 for key '1') -
+  // this looks more like a monotonic counter/timestamp than a duration.
+  // Testing that here: distinct, monotonically increasing values per
+  // event, never repeating.
   unsigned char content[64] = {0};
   content[0] = 0x00; content[1] = 0x01;
   unsigned char keys[3] = {0x1e, 0x1f, 0x20}; // '1' '2' '3'
   int off = 2;
+  unsigned char counter = 0x01;
   for (int i = 0; i < 3; i++) {
-    content[off++] = 0x00; content[off++] = keys[i];
-    content[off++] = 0x80; content[off++] = keys[i];
+    content[off++] = counter++; content[off++] = keys[i];
+    content[off++] = 0x80 | counter++; content[off++] = keys[i];
   }
   out64(h, content);
   usleep(20000);
