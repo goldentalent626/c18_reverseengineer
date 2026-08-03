@@ -723,8 +723,11 @@ int main(int argc, char **argv) {
   int ifaces[] = {0, 1, 2};
   for (int i = 0; i < 3; i++) {
     int iface = ifaces[i];
-    if (libusb_kernel_driver_active(h, iface) == 1) {
-      libusb_detach_kernel_driver(h, iface); // ignore errors
+    int kda = libusb_kernel_driver_active(h, iface);
+    fprintf(stderr, "iface %d: kernel_driver_active=%d\n", iface, kda);
+    if (kda == 1) {
+      int drc = libusb_detach_kernel_driver(h, iface);
+      if (drc) fprintf(stderr, "detach kernel driver %d failed: %d (%s)\n", iface, drc, libusb_error_name(drc));
     }
     rc = libusb_claim_interface(h, iface);
     if (rc) {
@@ -800,14 +803,16 @@ int main(int argc, char **argv) {
   send_cmd(h, OP_SELECT_COMMIT, profile, 0x00, "commit");
 
   for (int i = 0; i < 3; i++) {
-    libusb_release_interface(h, ifaces[i]);
+    int rrc = libusb_release_interface(h, ifaces[i]);
+    if (rrc) fprintf(stderr, "release interface %d failed: %d (%s)\n", ifaces[i], rrc, libusb_error_name(rrc));
     // Restore the kernel's own HID driver (hid-generic) so the mouse keeps
     // working normally in the OS after this program exits. Without this,
     // every invocation left the device's interfaces detached indefinitely -
     // cursor/clicks stopped working until a physical unplug/replug forced
     // re-enumeration. The device itself was never actually wedged; this was
     // purely a missing cleanup step here.
-    libusb_attach_kernel_driver(h, ifaces[i]);
+    int arc = libusb_attach_kernel_driver(h, ifaces[i]);
+    if (arc) fprintf(stderr, "attach kernel driver %d failed: %d (%s)\n", ifaces[i], arc, libusb_error_name(arc));
   }
 
   libusb_close(h);
