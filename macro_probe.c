@@ -126,23 +126,19 @@ int main(int argc, char **argv) {
 
   send_cmd(h, 0x0f, macro_id, 0x80, "prepare macro content");
 
-  // macro content: header 00 01, then press/release '1' '2' '3'.
-  // Testing a new theory: a FIXED repeated timing value (0x14 press /
-  // 0x94 release for every event) reproduced the "volume up" failure
-  // symptom, even though it's non-zero - ruling out "any non-zero value
-  // works". PROTOCOL.md's real captured example never repeats a value
-  // and press != release for the same key (0x46 vs 0x56 for key '1') -
-  // this looks more like a monotonic counter/timestamp than a duration.
-  // Testing that here: distinct, monotonically increasing values per
-  // event, never repeating.
+  // Testing Ctrl+C as a real chord: press ctrl, press c, release c,
+  // release ctrl - NOT the per-key press/release-before-next-key pattern
+  // c18ctl macro-create is limited to. HID usage 0xe0 = Left Ctrl, 0x06 = 'c'.
   unsigned char content[64] = {0};
   content[0] = 0x00; content[1] = 0x01;
-  unsigned char keys[3] = {0x1e, 0x1f, 0x20}; // '1' '2' '3'
+  unsigned char ev_keys[4]    = {0xe0, 0x06, 0x06, 0xe0};
+  unsigned char ev_release[4] = {0,    0,    1,    1   }; // 0=press 1=release
   int off = 2;
   unsigned char counter = 0x01;
-  for (int i = 0; i < 3; i++) {
-    content[off++] = counter++; content[off++] = keys[i];
-    content[off++] = 0x80 | counter++; content[off++] = keys[i];
+  for (int i = 0; i < 4; i++) {
+    content[off++] = ev_release[i] ? (0x80 | counter) : counter;
+    counter = (counter >= 0x7f) ? 1 : counter + 1;
+    content[off++] = ev_keys[i];
   }
   out64(h, content);
   usleep(20000);
