@@ -790,6 +790,13 @@ int main(int argc, char **argv) {
 
   for (int i = 0; i < 3; i++) {
     libusb_release_interface(h, ifaces[i]);
+    // Restore the kernel's own HID driver (hid-generic) so the mouse keeps
+    // working normally in the OS after this program exits. Without this,
+    // every invocation left the device's interfaces detached indefinitely -
+    // cursor/clicks stopped working until a physical unplug/replug forced
+    // re-enumeration. The device itself was never actually wedged; this was
+    // purely a missing cleanup step here.
+    libusb_attach_kernel_driver(h, ifaces[i]);
   }
 
   libusb_close(h);
