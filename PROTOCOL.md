@@ -319,6 +319,15 @@ one matches:
 | `0x000b` | Exact Control | Fixed `value=0x0f0f` — no settings dialog exists, this is the full encoding. Functional meaning unclear, but the wire encoding is settled. | `button <slot> exact-control` |
 | `0x0c \| (repeat_mode<<8)` | Armoury (burst-fire preset) reference | Same 3-mode repeat enum as macros. `value` is a fixed `0x0400` marker, not a preset index — confirmed identical across two different named presets ("Armoury1"/"Armoury2"); the device has no persistent per-preset ID, see Armoury section. | **Not implemented** — protocol fully decoded, just not built as a CLI command, see Armoury section |
 
+**Combo Key field ranges confirmed** (merged from the Windows capture box):
+Fire Button left at its popup defaults produced `byte6=0x02` (2ms)/`byte7=0x00`
+(0 times), matching the popup's own shown defaults exactly. Requesting a
+300ms delay produced `byte6=0x7f` (127) — the max positive value a signed
+8-bit field can hold — not a wraparound/truncation to 44 (`300 mod 256`),
+confirming `Delay` really is silently clamped at its real maximum rather
+than just "capped ~127" as an estimate. `Times=50` in the same test came
+back exact (`0x32`), confirming `Times` has no such ceiling.
+
 ### Modifier encoding (confirmed)
 
 | Modifier | Bit | `type` value |
@@ -635,6 +644,120 @@ from the vendor software); `c18ctl macro-create` does the full
 create-and-assign flow, generating its own event data and choosing the ID
 you pass it — see the Macros section above.
 
+## Macro Playback (previously undocumented — merged from Windows capture box)
+
+**Everything above this point describes uploading a macro's *definition* to
+the device. Nothing in this document previously covered what happens when a
+macro actually *plays back*** (i.e. you physically press the button it's
+assigned to). This is a completely separate mechanism, confirmed via three
+live tests on the vendor software/hardware: a no-delay "1,2,3" macro, the
+same macro re-recorded *with* real timing, and a no-delay macro with cycle
+count set to 3.
+
+### A new endpoint: `0x82`
+
+Macro playback happens entirely autonomously on the device — **no host
+software involvement is needed** once the button is physically pressed. It
+sends real, standard-format USB HID keyboard reports on **endpoint
+`0x82`**, an interrupt-IN endpoint never seen anywhere else in this
+document (everything else in this protocol uses `0x81`, `0x04`, or control
+transfer `0x00`). This is presumably tied to interface `MI_01` (previously
+described only as "system controller / consumer control") — not
+independently confirmed via the USB descriptor, but the endpoint number is
+consistent with that interface based on standard descriptor ordering.
+
+### Report format
+
+Each keystroke is a 16-byte interrupt-IN report:
+
+```
+[ReportID=0x01][Modifier=0x00][HID_keycode][13 bytes padding, zero]
+```
+
+Confirmed identical structure across all three tests — e.g. press "1":
+`01 00 1e 00 00 00 00 00 00 00 00 00 00 00 00 00`. A **release** is the
+same 16-byte shape with the keycode zeroed out: `01 00 00 00 ...` (i.e.
+"no keys currently down", not a distinct "release" report type — matches
+a standard USB HID boot-keyboard report exactly, which has no explicit
+release event, just a change in which keys are listed as down).
+
+### Markers (corrected)
+
+**Correction**: an earlier version of this section called the second 4-byte
+report an "end of playback" marker, based on a test where the whole macro
+finished in ~41ms and the two markers looked adjacent to "start" and "end."
+A follow-up test (3-key macro, real delays, 3 cycles) disproved that: the
+second marker fired **early** — immediately after the very *first* key's
+press+release, before 8 more keystrokes and two multi-second waits even
+happened. Corrected model:
+
+- **`06 09 01 <X>`** — sent once, right before the first keystroke of the
+  entire playback (confirmed: fires once regardless of cycle count).
+  `<X>` varies (`0x04` and `0x07` observed) — meaning still unconfirmed.
+- **`06 00 00 00`** — sent once, **immediately after the first key's
+  press+release specifically** — not after the whole macro or all cycles.
+  True meaning still unclear (possibly "setup/handshake complete, entering
+  normal playback" rather than "macro finished") — flagged as open, but
+  "end of playback" is now disproven, not just uncertain.
+
+Both use `ReportID=0x06`, distinct from the `0x01` keystroke reports.
+
+### Real timing is reproduced during playback, not just displayed in the UI
+
+Confirmed with a macro recorded with real ~2-second pauses (delay checkbox
+checked): playback showed genuine multi-second gaps between keystrokes on
+endpoint `0x82` — **~1485ms and ~2376ms** in the first (1-cycle) test,
+closely matching the recorded pauses. This confirms the wait-block
+mechanism isn't just a UI/storage artifact — the device's firmware
+genuinely times its own autonomous playback using the encoded wait values.
+
+### Cycle repeat behavior (fully confirmed, including wait-block replay)
+
+Two cycle tests, confirming different things:
+
+- **No-delay "1,2,3" macro, cycles=3**: the complete 3-key press/release
+  sequence repeats 3 full times **back-to-back with no extra pause between
+  cycles** — entire playback (all 3 cycles) completed in ~41ms.
+- **3-key macro with real ~1.6s and ~2.4s waits, cycles=3**: both
+  wait-block pauses **replay with high precision on every single cycle**,
+  not just the first pass. Measured gaps across all 3 repetitions:
+
+  | Gap | Cycle 1 | Cycle 2 | Cycle 3 |
+  |---|---|---|---|
+  | After key 1 (before key 2) | 1.577s | 1.577s | 1.578s |
+  | After key 2 (before key 3) | 2.376s | 2.375s | 2.376s |
+
+  Under 1.5ms variance across repetitions — the firmware reproduces the
+  encoded wait values with real timer precision on every cycle, not an
+  approximation that drifts or only applies once.
+
+The start marker fires once at the very beginning regardless of cycle
+count; the `06 00 00 00` marker (see above) fires once, early, also
+regardless of cycle count — neither repeats per-cycle.
+
+### Relevance to this repo's own driver debugging
+
+This section describes device-autonomous behavior — there is nothing here
+for `c18ctl`/the libratbag driver to *write*, since playback happens
+entirely in firmware once a macro is uploaded and its button is pressed.
+It's documented for diagnostic value: if a button assigned to a macro
+doesn't behave as expected, capturing endpoint `0x82` during a physical
+press (rather than re-inspecting the upload transaction, which was already
+hardware-confirmed to complete and acknowledge cleanly via the Feature-report
+readback — see the Macros section above) is the way to see what the device
+actually did, independent of whatever the upload side looked like.
+
+### Open items from this section
+
+- The start marker's 4th byte (`0x04` vs `0x07` observed) — meaning
+  unconfirmed.
+- The true meaning of the `06 00 00 00` marker — confirmed to fire early
+  (after key 1), not at the end, but its actual purpose is still unknown.
+- Exact interface ownership of endpoint `0x82` not confirmed via USB
+  descriptor inspection, only inferred.
+- Mouse-click playback (if macros can contain clicks) was not observed in
+  any playback test, since none of the test macros contained clicks.
+
 ## Armoury (burst-fire macro, "N Key") — fully decoded, not implemented in `c18ctl`
 
 A separate, unrelated sub-protocol from the keyboard-macro system above:
@@ -863,6 +986,14 @@ Genuinely still open:
   distinct from Up/Down/Cycle — not checked.
 - Whether "Disabled" is genuinely just `type=0x0000, value=0x00`, or a
   distinct explicit disable flag exists elsewhere.
+- **Macro Playback** (new section, merged from the Windows capture box —
+  see "Macro Playback" above): the wire-level mechanics of autonomous
+  device-side macro playback (endpoint `0x82`, marker reports, wait-block
+  replay) are now documented, but three sub-items remain unconfirmed: the
+  start marker's 4th byte (`0x04` vs `0x07`), the true meaning of the
+  `06 00 00 00` marker (confirmed to fire early, not at the end, but
+  purpose still unknown), and endpoint `0x82`'s exact interface ownership
+  (inferred, not confirmed via USB descriptor).
 - **Armoury**: fully resolved — repeat-mode encoding, confirmed no
   persistent preset index, single-/multi-projectile per-projectile fields
   (interval, X/Y correction, distinct interval formulas per mode), and both

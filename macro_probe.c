@@ -126,27 +126,53 @@ int main(int argc, char **argv) {
 
   send_cmd(h, 0x0f, macro_id, 0x80, "prepare macro content");
 
-  // Testing Ctrl+C as a real chord: press ctrl, press c, release c,
-  // release ctrl - NOT the per-key press/release-before-next-key pattern
-  // c18ctl macro-create is limited to. HID usage 0xe0 = Left Ctrl, 0x06 = 'c'.
-  unsigned char content[64] = {0};
-  content[0] = 0x00; content[1] = 0x01;
-  unsigned char ev_keys[4]    = {0xe0, 0x06, 0x06, 0xe0};
-  unsigned char ev_release[4] = {0,    0,    1,    1   }; // 0=press 1=release
-  int off = 2;
+  // Key count configurable (argv[3]) for direct apples-to-apples
+  // comparison between single-packet (proven working) and multi-packet
+  // (under investigation) with the identical tool/build/delays.
+  // 1234567890qwertyuiop, truncated to n_keys.
+  unsigned char all_keys[20] = {
+    0x1e,0x1f,0x20,0x21,0x22,0x23,0x24,0x25,0x26,0x27, // 1234567890
+    0x14,0x1a,0x08,0x15,0x17,0x1c,0x18,0x0c,0x12,0x13  // qwertyuiop
+  };
+  int n_keys = 20;
+  if (argc >= 4) n_keys = atoi(argv[3]);
+  if (n_keys < 1 || n_keys > 20) n_keys = 20;
+  printf("Using n_keys=%d\n", n_keys);
+  unsigned char *keys = all_keys;
+  unsigned char full[2 + 20*4];
+  full[0] = 0x00; full[1] = 0x01;
+  int foff = 2;
   unsigned char counter = 0x01;
-  for (int i = 0; i < 4; i++) {
-    content[off++] = ev_release[i] ? (0x80 | counter) : counter;
-    counter = (counter >= 0x7f) ? 1 : counter + 1;
-    content[off++] = ev_keys[i];
+  for (int i = 0; i < n_keys; i++) {
+    full[foff++] = counter; counter = (counter >= 0x7f) ? 1 : counter + 1;
+    full[foff++] = keys[i];
+    full[foff++] = 0x80 | counter; counter = (counter >= 0x7f) ? 1 : counter + 1;
+    full[foff++] = keys[i];
   }
-  out64(h, content);
-  usleep(20000);
-  poll_status(h, "macro content payload out64");
+  int total_len = foff;
+  int num_packets = (total_len + 63) / 64;
+  printf("macro content: %d bytes, %d packet(s)\n", total_len, num_packets);
+  for (int p = 0; p < num_packets; p++) {
+    unsigned char pkt[64] = {0};
+    int chunk = total_len - p * 64;
+    if (chunk > 64) chunk = 64;
+    memcpy(pkt, full + p * 64, chunk);
+    out64(h, pkt);
+    // Deliberately longer delay here specifically - testing whether a
+    // content-dense packet (unlike the sparse/all-zero primer/ack packets
+    // used everywhere else) genuinely needs more time to be processed
+    // before the next packet arrives, matching the same category of fix
+    // already confirmed necessary for the driver's hidraw transport
+    // (C18_MACRO_SETTLE_MS).
+    usleep(20000);
+    char label[32];
+    snprintf(label, sizeof(label), "content packet %d/%d", p + 1, num_packets);
+    poll_status(h, label);
+  }
 
   out64(h, zero);
-  usleep(40000);
-  poll_status(h, "macro content ack out64 (40ms)");
+  usleep(20000);
+  poll_status(h, "macro content ack out64");
 
   send_cmd(h, 0x02, 0x01, 0x00, "COMMIT");
 

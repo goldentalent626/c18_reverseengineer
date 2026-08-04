@@ -435,36 +435,65 @@ static unsigned char parse_macro_mode(const char *s) {
 // Only 1-2 packet macros (up to 48 events) have been verified against real
 // hardware (see PROTOCOL.md's "Multi-packet macros" section). This cap is
 // generous well beyond that to leave room, not a confirmed device limit.
-#define MAX_MACRO_KEYS 96
+#define MAX_MACRO_EVENTS 96
 
-// Builds a macro's full keyboard-event byte stream: `00 01` header followed
-// by press-then-release `[event_byte][keycode]` pairs for each key (see
-// PROTOCOL.md's Macros section). event_byte's low 7 bits are a hold-duration
-// timing value - confirmed via hardware testing (see macro_probe.c) that a
-// value of exactly 0 makes the device's macro player either silently no-op
-// or hang the device outright on button press, even though the upload
-// transaction itself always completes fine. A UNIFORM non-zero value (every
-// event using the same constant) reproduces the same failure - confirmed by
-// testing 0x14 for every event. What actually works: small, non-zero,
-// NON-REPEATING values, incrementing across events - matching the shape of
-// PROTOCOL.md's real captured "no delay" macro (values 1,1,1,2, never 0,
-// never repeated in sequence). Exact required precision beyond that is
-// unconfirmed.
-static int build_macro_events(unsigned char *buf, int buf_cap, const unsigned short *keys, int n_keys) {
-  int len = 2 + n_keys * 4;
+// A macro token is either a keystroke (press+release) or an inter-key wait.
+// Both occupy exactly 4 bytes on the wire, so build_macro_events() can size
+// the buffer uniformly regardless of the mix.
+typedef struct {
+  int is_wait;
+  unsigned short key;   // used when !is_wait
+  int wait_ms;          // used when is_wait
+} macro_event_t;
+
+// Wait-block value: raw = round(delay_ms / 50), clamped to 0x7f (~6350ms,
+// the device's confirmed max representable wait) - PROTOCOL.md's "Wait-block
+// formula" section, calibrated exactly against the vendor software's own
+// displayed timing values.
+static unsigned char wait_ms_to_raw(int delay_ms) {
+  if (delay_ms < 0) delay_ms = 0;
+  int raw = (delay_ms + 25) / 50; // round to nearest
+  if (raw > 0x7f) raw = 0x7f;
+  return (unsigned char)raw;
+}
+
+// Builds a macro's full event byte stream: `00 01` header followed by one
+// 4-byte unit per token (see PROTOCOL.md's Macros section):
+//   - keystroke: press-then-release `[event_byte][keycode]` pair.
+//     event_byte's low 7 bits are a hold-duration timing value - confirmed
+//     via hardware testing (see macro_probe.c) that a value of exactly 0
+//     makes the device's macro player either silently no-op or hang the
+//     device outright on button press, even though the upload transaction
+//     itself always completes fine. A UNIFORM non-zero value (every event
+//     using the same constant) reproduces the same failure - confirmed by
+//     testing 0x14 for every event. What actually works: small, non-zero,
+//     NON-REPEATING values, incrementing across events - matching the shape
+//     of PROTOCOL.md's real captured "no delay" macro (values 1,1,1,2, never
+//     0, never repeated in sequence). Exact required precision beyond that
+//     is unconfirmed.
+//   - wait: fixed marker `00 03` followed by `00 <raw>` (see wait_ms_to_raw).
+static int build_macro_events(unsigned char *buf, int buf_cap, const macro_event_t *events, int n_events) {
+  int len = 2 + n_events * 4;
   if (len > buf_cap) die("macro too long");
   memset(buf, 0, buf_cap);
   buf[0] = 0x00;
   buf[1] = 0x01;
   int off = 2;
   unsigned char timing = 0x01;
-  for (int i = 0; i < n_keys; i++) {
+  for (int i = 0; i < n_events; i++) {
+    if (events[i].is_wait) {
+      buf[off++] = 0x00;
+      buf[off++] = 0x03;
+      buf[off++] = 0x00;
+      buf[off++] = wait_ms_to_raw(events[i].wait_ms);
+      continue;
+    }
     buf[off++] = timing;                          // press
     timing = (timing >= 0x7f) ? 1 : timing + 1;    // stay in 7 bits, never 0
-    buf[off++] = (unsigned char)keys[i];
+    buf[off++] = (unsigned char)events[i].key;
     buf[off++] = 0x80 | timing;                    // release
     timing = (timing >= 0x7f) ? 1 : timing + 1;
-    buf[off++] = (unsigned char)keys[i];
+    buf[off++] = (unsigned char)events[i].key;
   }
   return len;
 }
@@ -475,6 +504,23 @@ static int build_macro_events(unsigned char *buf, int buf_cap, const unsigned sh
 // packet carries the `00 01` header; later packets are a raw continuation
 // of the event stream with no header of their own (confirmed in the
 // "Multi-packet macros" section).
+//
+// Content packets specifically (as opposed to the sparse/all-zero primer/ack
+// packets used elsewhere) get a longer settle delay between them when more
+// than one is needed. Root-caused via a real endpoint-0x82 playback capture:
+// a 20-key/2-packet macro's upload always acked cleanly (transaction
+// complete per the device's GET_REPORT status echo), but physically pressing
+// the button only ever played back 3 of the 20 keys - while an otherwise
+// byte-identical 15-key/1-packet macro (exactly packet 1's own content, no
+// continuation) played back completely. So the corruption is specific to the
+// packet1->packet2 handoff, not content length or a hard playback-length
+// limit; a 20ms gap is apparently too short for the device's firmware to
+// finish digesting a dense content packet before the next one lands (same
+// category of fix already needed for the libratbag driver's hidraw
+// transport, C18_MACRO_SETTLE_MS, but this is libusb's synchronous
+// interrupt transfer - USB-transfer completion isn't the same guarantee as
+// "firmware has finished parsing the payload").
+#define MACRO_CONTENT_SETTLE_US 200000
 static void send_macro_content(libusb_device_handle *h, unsigned char ep_out, const unsigned char *buf, int len) {
   int num_packets = (len + 63) / 64;
   if (num_packets > 2) {
@@ -491,7 +537,7 @@ static void send_macro_content(libusb_device_handle *h, unsigned char ep_out, co
     int xfer = 0;
     int rc = out64(h, ep_out, pkt, &xfer);
     if (rc || xfer != 64) fprintf(stderr, "macro content packet %d/%d failed: rc=%d xfer=%d\n", i + 1, num_packets, rc, xfer);
-    usleep(20000);
+    usleep(num_packets > 1 ? MACRO_CONTENT_SETTLE_US : 20000);
   }
   unsigned char zero[64] = {0};
   int xfer = 0;
@@ -524,7 +570,7 @@ static void usage(void) {
     "  sudo ./c18ctl button <slot 1-11> combo <times> <delay_ms> [profile]\n"
     "  sudo ./c18ctl button <slot 1-11> exact-control [profile]\n"
     "  sudo ./c18ctl button <slot 1-11> macro <0xHH id> <once|until-interrupted|until-released> [profile]\n"
-    "  sudo ./c18ctl macro-create <slot 1-11> <0xHH id> <once|until-interrupted|until-released> <key1> [key2 ...]\n"
+    "  sudo ./c18ctl macro-create <slot 1-11> <0xHH id> <once|until-interrupted|until-released> <key1|wait:ms> [...]\n"
     "\n"
     "Colors: red green blue yellow purple cyan white off\n"
     "mods: any combination of c/s/a/w (Ctrl/Shift/Alt/Win), or -/none.\n"
@@ -536,7 +582,12 @@ static void usage(void) {
     "listed is pressed then released, in order) AND assigns it to <slot>, in\n"
     "one transaction, choose any <0xHH id> not already used by another button/\n"
     "Armoury preset on this profile (the device does no allocation itself, see\n"
-    "PROTOCOL.md). Keys use the same a-z/0-9/0xHH syntax as `button key`.\n"
+    "PROTOCOL.md). Keys use the same a-z/0-9/0xHH syntax as `button key`. A\n"
+    "token of the form wait:<ms> inserts a real inter-key pause (device-timed,\n"
+    "replayed on every macro cycle) instead of a keystroke, e.g. `1 wait:2000\n"
+    "2` presses/releases '1', pauses ~2s, then presses/releases '2'; clamped\n"
+    "to the device's ~6350ms max representable wait (PROTOCOL.md's wait-block\n"
+    "formula, raw=round(ms/50)).\n"
     "macro-create always targets profile 1 (not yet exposed as an option).\n"
     "\n"
     "dpi-set writes the whole DPI table, seeded from the profile's factory\n"
@@ -558,8 +609,8 @@ int main(int argc, char **argv) {
   unsigned char profile = 1;
   unsigned char arg_byte = 0; // polling interval or dpi stage, depending on kind
   unsigned char macro_id = 0;
-  unsigned short macro_keys[MAX_MACRO_KEYS];
-  int n_macro_keys = 0;
+  macro_event_t macro_events[MAX_MACRO_EVENTS];
+  int n_macro_events = 0;
 
   const char *cmd = argv[1];
 
@@ -694,10 +745,21 @@ int main(int argc, char **argv) {
     unsigned char mode = parse_macro_mode(argv[4]);
 
     for (int i = 5; i < argc; i++) {
-      if (n_macro_keys >= MAX_MACRO_KEYS) die("macro too long (see MAX_MACRO_KEYS / PROTOCOL.md open items)");
-      macro_keys[n_macro_keys++] = parse_key(argv[i]);
+      if (n_macro_events >= MAX_MACRO_EVENTS) die("macro too long (see MAX_MACRO_EVENTS / PROTOCOL.md open items)");
+      if (strncmp(argv[i], "wait:", 5) == 0) {
+        int ms = atoi(argv[i] + 5);
+        if (ms <= 0) die("wait:<ms> must be a positive number of milliseconds");
+        if (ms > 6350)
+          fprintf(stderr, "warning: wait:%dms exceeds the device's ~6350ms max representable wait; clamping to 0x7f (~6350ms)\n", ms);
+        macro_events[n_macro_events].is_wait = 1;
+        macro_events[n_macro_events].wait_ms = ms;
+      } else {
+        macro_events[n_macro_events].is_wait = 0;
+        macro_events[n_macro_events].key = parse_key(argv[i]);
+      }
+      n_macro_events++;
     }
-    if (n_macro_keys == 0) die("macro-create needs at least one key");
+    if (n_macro_events == 0) die("macro-create needs at least one key");
 
     profile = 1; // macro-create always targets profile 1 (see usage)
     unsigned short btype = (unsigned short)(0x0009 | (mode << 8));
@@ -791,8 +853,8 @@ int main(int argc, char **argv) {
       usleep(20000);
     }
 
-    unsigned char macro_buf[2 + MAX_MACRO_KEYS * 4];
-    int macro_len = build_macro_events(macro_buf, sizeof(macro_buf), macro_keys, n_macro_keys);
+    unsigned char macro_buf[2 + MAX_MACRO_EVENTS * 4];
+    int macro_len = build_macro_events(macro_buf, sizeof(macro_buf), macro_events, n_macro_events);
 
     send_cmd(h, OP_PREPARE_EXT_DATA, macro_id, 0x80, "prepare macro content upload");
     send_macro_content(h, ep_out, macro_buf, macro_len);

@@ -9,6 +9,8 @@ a.out
 /c18ctl
 /c18_usb_seq3
 /macro_probe
+/macro_playback_capture
+/restore_defaults
 /attic/c18_usb
 /attic/c18_usb_seq
 /attic/c18_usb_seq2
