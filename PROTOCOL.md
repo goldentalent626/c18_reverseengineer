@@ -495,10 +495,8 @@ pair (not present before the very first key). Confirmed via two live tests:
   different formula.
 - **Driver implication**: a driver can now compute exact wait-block values
   for any requested pause up to 6350ms using `round(ms / 50)`, clamped to
-  `0x7f` above that. **Still not implemented in `c18ctl macro-create` or
-  the libratbag driver** — both currently skip `RATBAG_MACRO_EVENT_WAIT`
-  events entirely rather than emitting a wait-block; the formula above is
-  ready to use whenever that's picked up. The per-event hold-duration field
+  `0x7f` above that. **Implemented in both `c18ctl macro-create` (`wait:<ms>`
+  token) and the libratbag driver** — hardware-confirmed. The per-event hold-duration field
   (separate from wait-blocks) is a different matter — see the correction
   above; it must be small and non-zero, not simply "safe to leave at 0."
 
@@ -1012,13 +1010,22 @@ work, not blocked on RE)**:
 - `c18ctl macro-create` always targets profile 1 — a driver wanting
   profile-2 macros would need to expose that.
 
-**Not yet implemented (protocol is now understood, this is pure CLI/driver
-work)**:
-- Inter-key wait blocks (deliberate multi-second pauses in a macro) — the
-  4-byte `[00 03][00 <value>]` block structure, its `0x7f` ceiling, and now
-  the exact `raw = round(ms / 50)` scale are all confirmed (see the Macros
-  section) — `c18ctl macro-create` and the libratbag driver both still just
-  skip wait events entirely rather than emitting a real wait-block.
-- DPI table X/Y independence — every DPI test this session set the X-DPI and
-  Y-DPI bytes to the same value; whether the vendor software (or the device)
-  supports setting them independently was never exercised.
+~~Inter-key wait blocks~~ — **implemented**. Both `c18ctl macro-create`
+(`wait:<ms>` token in the key list) and the libratbag driver now emit real
+wait-blocks using the calibrated `raw = round(ms / 50)` formula, instead of
+skipping wait events. Hardware-confirmed end-to-end through both.
+
+**DPI table X/Y independence — resolved, not possible on this hardware.**
+The vendor software's own UI has no separate X/Y DPI control at all (a
+single slider per sensitivity level, see `docs/vendor-software/
+performance-tab.png`) — every capture this project has ever taken set the
+X-DPI and Y-DPI bytes to the same value simply because the software never
+offers a way to set them differently. Directly tested by bypassing the
+vendor software: `c18ctl dpi-set-xy <stage> <dpi_x> <dpi_y>` writes
+deliberately different values to the two byte slots (confirmed via extreme
+values, X=10000/Y=200 on stage 1) and the mouse was moved to compare
+horizontal vs. vertical cursor speed. **Both directions moved at the same
+speed** — the device does not apply the two DPI byte slots independently,
+despite the wire format having two distinct offsets for them. A driver
+should treat DPI as a single per-stage value, not attempt to expose
+separate X/Y controls.

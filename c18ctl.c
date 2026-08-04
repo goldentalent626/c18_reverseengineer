@@ -359,6 +359,19 @@ static void build_payload_dpi_stage(unsigned char payload[64], int profile, int 
   payload[DPI_STAGE_OFFSETS[stage].y_off] = b;
 }
 
+// Diagnostic-only: patches X and Y with independently-chosen DPI values,
+// bypassing the vendor software entirely (its own UI has no separate X/Y
+// control at all - see PROTOCOL.md's DPI X/Y independence open item). Used
+// to test on real hardware whether the device firmware actually honors two
+// different values, or silently keeps them in sync despite the wire format
+// having two distinct byte slots.
+static void build_payload_dpi_stage_xy(unsigned char payload[64], int profile, int stage, int dpi_x, int dpi_y) {
+  if (stage < 1 || stage > 5) die("DPI stage must be 1-5");
+  memcpy(payload, profile == 2 ? PROFILE2_DPI_DEFAULT : PROFILE1_DPI_DEFAULT, 64);
+  payload[DPI_STAGE_OFFSETS[stage].x_off] = dpi_to_byte(dpi_x);
+  payload[DPI_STAGE_OFFSETS[stage].y_off] = dpi_to_byte(dpi_y);
+}
+
 // USB HID Keyboard/Keypad usage page (standard, not device-specific) — matches
 // every example byte given in PROTOCOL.md's button type/value table.
 static unsigned short parse_key(const char *s) {
@@ -559,6 +572,7 @@ static void usage(void) {
     "  sudo ./c18ctl polling <125|250|500|1000> [profile]\n"
     "  sudo ./c18ctl dpi-stage <1-5> [profile]\n"
     "  sudo ./c18ctl dpi-set <stage 1-5> <dpi 200-10000> [profile]\n"
+    "  sudo ./c18ctl dpi-set-xy <stage 1-5> <dpi_x> <dpi_y> [profile]  (diagnostic - see PROTOCOL.md X/Y independence open item)\n"
     "  sudo ./c18ctl button <slot 1-11> off [profile]\n"
     "  sudo ./c18ctl button <slot 1-11> key <a-z0-9|0xHH> [profile]\n"
     "  sudo ./c18ctl button <slot 1-11> media <volup|voldown|playpause|stop|mute|next|prev|mediaplayer|mycomputer|home|0xHH> [profile]\n"
@@ -658,6 +672,11 @@ int main(int argc, char **argv) {
     kind = KIND_DPI_TABLE;
     profile = parse_profile(argc >= 5 ? argv[4] : NULL);
     build_payload_dpi_stage(payload, profile, atoi(argv[2]), atoi(argv[3]));
+  } else if (streq(cmd, "dpi-set-xy")) {
+    if (argc < 5) { usage(); return 2; }
+    kind = KIND_DPI_TABLE;
+    profile = parse_profile(argc >= 6 ? argv[5] : NULL);
+    build_payload_dpi_stage_xy(payload, profile, atoi(argv[2]), atoi(argv[3]), atoi(argv[4]));
   } else if (streq(cmd, "button")) {
     if (argc < 4) { usage(); return 2; }
     int slot = atoi(argv[2]);
