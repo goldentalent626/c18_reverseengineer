@@ -5,9 +5,12 @@ Reverse-engineered USB HID protocol for the SOAI C18 gaming mouse (USB VID:PID
 select, polling rate, DPI (both active-stage select and all 5 stages' DPI
 values), and full button remapping (all 11 buttons — keys, media keys, native
 clicks, DPI/profile functions, keyboard-modifier shortcuts, Combo Key, Exact
-Control, and macro references). Long-term goal is a full
-[libratbag](https://github.com/libratbag/libratbag) driver so the mouse can be
-configured on Linux via Piper.
+Control, and macro references). A full [libratbag](https://github.com/libratbag/libratbag)
+driver built on this protocol reference is feature-complete and
+hardware-confirmed in a separate repo
+([`PadreAdamo/libratbag`](https://github.com/PadreAdamo/libratbag), branch
+`soai-c18-driver`) — see the Status section below — so the mouse can be
+configured on Linux via Piper once that's merged upstream.
 
 ## Status
 
@@ -15,21 +18,32 @@ configured on Linux via Piper.
   neon, breathing, flowing, and wave modes.
 - **Profile select, polling rate, DPI active-stage select, DPI value (all 5
   stages): fully decoded and working** (`c18ctl profile|polling|dpi-stage|dpi-set`).
+  Independent X/Y DPI is not possible on this hardware — confirmed by
+  writing deliberately different X/Y bytes directly (bypassing the vendor
+  software, which has no X/Y control at all) and observing identical cursor
+  speed in both directions; treat DPI as one value per stage.
 - **Button remapping: fully decoded and working for all 11 buttons**
   (`c18ctl button`) — keyboard keys, media keys, native mouse clicks,
   DPI/profile functions, keyboard-modifier shortcuts (single and two-key),
   Combo Key (Double-click/Three-click/Fire Button), Exact Control, and macro
-  references. Real limitation: no readback exists, so every call rewrites the
-  whole table and resets any other previously-set button back to factory
-  default (same limitation applies to `dpi-set`).
+  references. Real hardware limitation: no readback exists, so every write
+  is a rewrite of the *entire* button table (same for `dpi-set`'s DPI-stage
+  table) — there's no way to patch a single slot on the wire. `c18ctl` itself
+  is a stateless one-shot CLI, so calling it twice for two different buttons
+  will reset the first back to factory default; a real client needs to hold
+  the full table in memory and always write it back complete. The libratbag
+  driver (see below) does exactly this — it caches all 11 buttons/5 DPI
+  stages and patches only the dirty entries before rewriting, so multiple
+  buttons stay set correctly through normal use.
 - **Macro creation and upload: fully decoded and working** (`c18ctl
   macro-create <slot> <id> <mode> <key1> [key2 ...]`). Macro creation is
   100% host-side — the device never negotiates or allocates an ID, so a
   driver is free to pick any unused one itself — and content upload goes via
   opcode `0x0f`, including multi-packet macros beyond one 64-byte payload
   (verified up to 2 packets / 48 events). Inter-key wait blocks (deliberate
-  multi-second pauses) are structurally decoded but not yet calibrated or
-  implemented — see `PROTOCOL.md`.
+  multi-second pauses) are fully calibrated (`raw = round(ms / 50)`, capped
+  at `0x7f`) and implemented in both `c18ctl macro-create` (`wait:<ms>`
+  token) and the libratbag driver — see `PROTOCOL.md`.
 - **Armoury (burst-fire presets): fully decoded, not implemented as a CLI
   command** — repeat-mode encoding, single-/multi-projectile fire-parameter
   fields, cycle count (a raw byte, 1-255), and projectile count (implicit —
@@ -37,9 +51,14 @@ configured on Linux via Piper.
   explicit length field) are all confirmed — see `PROTOCOL.md`. Not
   implemented regardless; the variable-length packet format wasn't worth the
   added CLI surface without a concrete use case.
-- **libratbag driver: not started** — the one remaining protocol gap (macro
-  wait-block timing calibration) is minor enough that this is now the
-  practical next step rather than something blocked on further RE.
+- **libratbag driver: feature-complete and hardware-confirmed**, in a
+  separate repo ([`PadreAdamo/libratbag`](https://github.com/PadreAdamo/libratbag),
+  branch `soai-c18-driver`, not this one). LED, DPI, all 11 buttons, profile
+  switching, and full macro upload/playback (including wait blocks and all 3
+  repeat modes) are implemented and verified end-to-end on real hardware
+  through the actual driver via `ratbagd`/`ratbagctl`, not just via `c18ctl`.
+  Nothing protocol- or hardware-level remains open; the PR upstream to
+  libratbag just hasn't been opened yet.
 
 See [`PROTOCOL.md`](PROTOCOL.md) for the full reverse-engineered wire protocol.
 
